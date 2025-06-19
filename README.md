@@ -139,3 +139,7 @@ Let me know if you’d like me to also include:
 	•	Scenario-based case questions
 	•	Behavioral questions specific to operational risk
 	•	Or prepare mock answers using your past project experiences (like the root cause model or PBWM work).
+
+
+
+I’ve noticed that when I’m deep into technical solutioning, I sometimes default to very detailed explanations, especially when explaining models or workflows. Over time, I’ve learned to adapt my communication based on the audience — simplifying the message for senior stakeholders or regulators, while diving deeper with technical teams. It’s still something I consciously adjust depending on who’s in the room, but I’ve made good progress by using storytelling, visuals, and analogies to make technical ideas resonate better.
