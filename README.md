@@ -40,3 +40,102 @@ Since it’s an internal move, I’m also confident I can hit the ground running
 ⸻
 
 Let me know if you’d like a version that’s more personal growth-focused, team impact-driven, or even slightly ambitious yet humble — depending on the tone you want to convey.
+
+
+
+Thanks for sharing the job description — based on the role being within Operational Risk and targeting a Senior Data Scientist/VP-level position, here’s a set of basic to intermediate questions related to risk, controls, and operational risk, along with sample answers you can prepare with.
+
+⸻
+
+✅ GENERAL OPERATIONAL RISK INTERVIEW QUESTIONS
+
+1. What is operational risk? How is it different from credit or market risk?
+
+Answer:
+Operational risk is the risk of loss resulting from inadequate or failed internal processes, people, systems, or external events. Unlike credit risk (which relates to borrower default) or market risk (which involves loss due to market fluctuations), operational risk is more internal — for example, processing errors, system failures, or regulatory breaches. It is also more unpredictable and harder to quantify directly.
+
+⸻
+
+2. What are Key Risk Indicators (KRIs) and how do they help in managing operational risk?
+
+Answer:
+KRIs are metrics used to provide an early signal of increasing risk exposures in various areas of a business. They are typically derived from control failures, incident counts, near misses, audit findings, or thresholds being breached. In my past work, I’ve helped teams analyze KRIs alongside control effectiveness to identify deteriorating trends before incidents occur.
+
+⸻
+
+3. What are some examples of operational risk events?
+
+Answer:
+Examples include:
+	•	System outages
+	•	Internal fraud or misconduct
+	•	Data breaches
+	•	Failure to comply with regulatory policies
+	•	Third-party service failure
+In my recent project, I worked on extracting root causes from risk event narratives — so I’ve seen a range of real-world incidents that originated from control gaps or process lapses.
+
+⸻
+
+4. What is the three lines of defence model in risk management?
+
+Answer:
+	•	1st Line: Business units/process owners — responsible for owning and managing risks.
+	•	2nd Line: Risk & compliance functions — responsible for oversight, challenge, and assurance.
+	•	3rd Line: Internal audit — provides independent assurance on effectiveness of governance and controls.
+I’ve worked primarily in the 1st line (Control Assurance), collaborating with 2nd line partners to help strengthen control testing using analytics.
+
+⸻
+
+5. What is a control? How do you assess its effectiveness?
+
+Answer:
+A control is a process or activity put in place to prevent or detect risk events. For example, segregation of duties is a control against internal fraud. Control effectiveness is usually assessed through:
+	•	Testing frequency and outcome
+	•	Incident history
+	•	Audit findings
+	•	Control design coverage
+I’ve automated control effectiveness testing in my current role, combining rule-based checks with NLP reviews of test narratives.
+
+⸻
+
+✅ DATA SCIENCE IN OPERATIONAL RISK CONTEXT
+
+6. How can data science help improve operational risk management?
+
+Answer:
+Data science can automate manual testing, detect emerging risk trends, and support proactive decision-making. For example:
+	•	NLP can extract root causes from incident narratives
+	•	ML models can predict likelihood of control failures
+	•	Dashboards can monitor KRIs and risk indicators in near real-time
+In one of my projects, we used semantic search to help risk teams identify systemic issues faster by analyzing free-text narratives.
+
+⸻
+
+7. How would you build a model to predict control breaches or risk incidents?
+
+Answer:
+I would:
+	1.	Gather historical risk event and control test data
+	2.	Identify features such as control owner, last test outcome, business unit, related KRIs
+	3.	Label the data with breach occurrence (binary)
+	4.	Train models like logistic regression, random forest, or XGBoost
+	5.	Validate using precision-recall and assess business interpretability
+Most importantly, I’d ensure the model includes explainability (like SHAP) and regulatory alignment.
+
+⸻
+
+8. What challenges do you see in applying ML/AI in operational risk?
+
+Answer:
+	•	Data quality: unstructured or inconsistent risk logs
+	•	Model interpretability: regulators require explainability
+	•	Change management: business adoption can be slow
+	•	Governance: proper model validation and monitoring is critical
+I’ve faced and addressed many of these in my role by involving SMEs early, ensuring traceability, and building dashboards for transparency.
+
+⸻
+
+Let me know if you’d like me to also include:
+	•	Scenario-based case questions
+	•	Behavioral questions specific to operational risk
+	•	Or prepare mock answers using your past project experiences (like the root cause model or PBWM work).
