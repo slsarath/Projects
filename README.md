@@ -142,4 +142,87 @@ Let me know if you’d like me to also include:
 
 
 
-I’ve noticed that when I’m deep into technical solutioning, I sometimes default to very detailed explanations, especially when explaining models or workflows. Over time, I’ve learned to adapt my communication based on the audience — simplifying the message for senior stakeholders or regulators, while diving deeper with technical teams. It’s still something I consciously adjust depending on who’s in the room, but I’ve made good progress by using storytelling, visuals, and analogies to make technical ideas resonate better.
+I’ve noticed that when I’m deep into technical solutioning, I sometimes default to very detailed explanations, especially when explaining models or workflows. Over time, I’ve learned to adapt my communication based on the audience — simplifying the message for senior stakeholders or regulators, while diving deeper with technical teams. It’s still something I consciously adjust depending on who’s in the room, but I’ve made good progress by using storytelling, visuals, and analogies to make technical ideas resonate better
+
+
+
+Perfect addition, Sarath. Here’s your updated guest speaker script with that impactful 24-hour challenge included—highlighting the intensity, effort, and learning during the hackathon. I’ve naturally woven it into the flow to keep it engaging and inspiring for a non-technical audience.
+
+⸻
+
+🗣️ Guest Speaker Script – Hackathon Experience (Intelligent Risk Assistant)
+
+[Begin with a warm and confident tone]
+
+Hi everyone, I’m Sarath from the Data Science team.
+A few weeks back, a group of us participated in an internal hackathon—and today, we’re excited to take you through the journey of how we tackled a real-world risk problem and turned it into an intelligent solution.
+
+Let me first quickly introduce our team:
+We had Ram, Sachin, and myself from the Data Science team, with Sachin also bringing in valuable insights from the TCV function.
+To make it cross-functional, we also looped in Madhvi and Smita, who showed great enthusiasm and joined us on this exciting challenge. It was a great mix of skills and perspectives.
+
+⸻
+
+🧯 Background: A Real Incident That Inspired the Idea
+
+Roughly 3–4 months ago, there was a major technical glitch that occurred within the bank’s systems.
+This wasn’t just a minor hiccup—it had a huge financial impact and brought risk, compliance, and operations under the spotlight.
+
+That made us reflect:
+Could we have predicted this? Could an intelligent system have alerted us to such risks before they caused real damage?
+
+⸻
+
+💡 Our Initial Concept
+
+Initially, we envisioned building a proactive model that monitors regulatory updates and automatically maps them to internal risks and controls—basically a system that helps organizations stay compliant and protected, even as regulations evolve.
+
+But due to limited public data in this space, we had to pivot.
+
+⸻
+
+🔄 The Pivot – Building the Intelligent Risk Assistant
+
+Instead, we turned to incident and risk management data. We created synthetic datasets for:
+	•	Various Risk Events
+	•	And their corresponding Controls
+
+Using NLP techniques, we built a model that could intelligently map risks to controls, highlighting areas of alignment and possible gaps.
+
+This became our Intelligent Risk Assistant—a smart tool that helps teams prioritize and act proactively when risks arise.
+
+⸻
+
+🕒 The Real Hack: 24 Hours of Innovation
+
+Now, here’s where it gets even more exciting…
+
+This entire solution—from data preparation to model building and deployment—had to be completed within just 24 hours.
+
+We had to:
+	•	Create the dataset from scratch
+	•	Generate synthetic risk and control records
+	•	Write all the code
+	•	Deploy the model on Azure servers (thanks to our third-party collaboration with Azure as part of the hackathon)
+	•	And finally, prepare a presentation to be delivered in front of a panel of jury members
+
+It was intense, it was fast-paced, and yes—it was also a fantastic experience!
+
+⸻
+
+🤝 Team Effort and Takeaways
+
+We learned a lot—not just technically, but in how to collaborate, stay agile, and solve real problems under pressure.
+It gave us a chance to apply our skills in a meaningful way, and we walked away feeling proud of what we created together.
+
+⸻
+
+🎙️ Passing the Mic
+
+With that, I’ll now hand it over to Ram, who will take you through the technical architecture, the models we used, and how we brought the idea to life.
+
+Over to you, Ram.
+
+⸻
+
+Let me know if you’d like this turned into a slide-ready format or need additional talking points for Q&A.
