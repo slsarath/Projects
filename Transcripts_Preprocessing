@@ -1,84 +1,234 @@
-Perfect — let’s get concrete. I’ll assume you have your dataset in a Pandas DataFrame called df with a column transcript (full call text) and materiality (Complaint/Concern).
-
-Here’s a full preprocessing pipeline for Step 2:
-
-import pandas as pd
+# =========================
+# STEP 2: Preprocessing pipeline for transcripts with AGENT/CUSTOMER labels
+# =========================
 import re
+import unicodedata
+import pandas as pd
 import spacy
 
-# Load English model for lemmatization
+# ---- Load spaCy once (lemmatization)
+# Make sure you have the model: python -m spacy download en_core_web_sm
 nlp = spacy.load("en_core_web_sm", disable=["parser", "ner"])
 
-# Example: df.head()
-# df = pd.DataFrame({
-#     "call_id": [1,2],
-#     "transcript": [
-#         "Agent: Welcome to Barclays\nCustomer: I am calling to raise complaint against the product, which I am not able to use",
-#         "Agent: Good morning\nCustomer: I forgot my PIN and need a new one"
-#     ],
-#     "materiality": ["COMPLAINT", "CONCERN"]
-# })
+# ---------- Config ----------
+SEP_TOKEN = " [SEP] "   # turn-separator when preserving structure
 
-# ------------------------------------------------------
-# 1. Remove headers like 'Agent:' / 'Customer:'
-def remove_speaker_labels(text):
-    return re.sub(r"\b(Agent|Customer)\s*[:\-]?\s*", "", text, flags=re.IGNORECASE)
+# Conservative filler list (speech disfluencies; excludes 'like' and 'okay' by default)
+FILLER_WORDS = {
+    "um","uh","umm","uhh","erm","er","eh","hmm","mm","mmm","ah","oh","uhm","ya","yeahh",
+    "umhum","mhm","huh","ummm","hmmm"
+}
+# Filler phrases (remove as whole phrases)
+FILLER_PHRASES = [
+    r"\byou know\b",
+    r"\bi mean\b",
+    r"\bkind of\b",
+    r"\bsort of\b",
+    r"\bto be honest\b",
+    r"\bto be fair\b",
+    r"\bif that makes sense\b"
+]
 
-# ------------------------------------------------------
-# 2. Normalize text (lowercasing + punctuation removal)
-def normalize_text(text):
-    # Lowercase
+# Negations to keep even when removing stopwords
+NEGATIONS = {"no", "not", "never", "n't"}
+
+
+# ---------- Helpers ----------
+def normalize_unicode(text: str) -> str:
+    # Fix curly quotes, stray unicode, etc.
+    return unicodedata.normalize("NFKC", text)
+
+def scrub_bracketed(text: str) -> str:
+    # Remove [PII], [NAME], [1234], etc. Keep a space to avoid word joins.
+    return re.sub(r"\[[^\]]+\]", " ", text)
+
+def insert_speaker_delims(text: str) -> str:
+    """
+    Ensure 'AGENT' and 'CUSTOMER' are split points even when inline.
+    Example: "...help you CUSTOMER I'd like..." -> "...help you |||CUSTOMER I'd like..."
+    """
+    # Normalize newlines to spaces; we will use explicit speaker tokens for splitting
+    t = re.sub(r"[\r\n]+", " ", text)
+    # Add delimiter before each speaker token
+    t = re.sub(r"\b(AGENT|CUSTOMER)\b", r"||| \1", t)
+    return t
+
+def split_by_speaker(text: str):
+    """
+    Return list of (speaker, utterance). Robust to missing colons.
+    """
+    chunks = [c.strip() for c in insert_speaker_delims(text).split("|||") if c.strip()]
+    segments = []
+    current = None
+    for ch in chunks:
+        if ch.startswith("AGENT") or ch.startswith("CUSTOMER"):
+            spk = "AGENT" if ch.startswith("AGENT") else "CUSTOMER"
+            content = ch[len(spk):].strip(" :-\t")
+            if content:
+                segments.append((spk, content))
+            current = spk
+        else:
+            # Continuation of previous speaker or unknown; attach to current if exists
+            if current:
+                segments.append((current, ch))
+            else:
+                segments.append(("UNK", ch))
+    return segments
+
+def collapse_stutters(text: str) -> str:
+    # "I- I" / "I -- I" / "I I" -> "I"
+    text = re.sub(r"\b(\w+)\s*[-–—]{1,2}\s*\1\b", r"\1", text)
+    text = re.sub(r"\b(\w+)\s+\1\b", r"\1", text)
+    # Reduce elongated letters: "sooooo" -> "soo"
+    text = re.sub(r"(.)\1{2,}", r"\1\1", text)
+    return text
+
+def remove_fillers(text: str) -> str:
+    # Remove filler phrases first
+    for pat in FILLER_PHRASES:
+        text = re.sub(pat, " ", text, flags=re.IGNORECASE)
+    # Remove standalone filler tokens with boundaries
+    if FILLER_WORDS:
+        pat = r"\b(" + "|".join(re.escape(w) for w in sorted(FILLER_WORDS, key=len, reverse=True)) + r")\b"
+        text = re.sub(pat, " ", text, flags=re.IGNORECASE)
+    # Common discourse clutter
+    text = re.sub(r"\b(um+|uh+|mmm+|hmm+)\b", " ", text, flags=re.IGNORECASE)
+    return text
+
+def basic_normalize(text: str) -> str:
+    # Lowercase but keep apostrophes for spaCy tokenization ("can't")
     text = text.lower()
-    # Remove punctuation, numbers, special chars (keep words)
-    text = re.sub(r"[^a-z\s]", " ", text)
-    # Remove extra spaces
+    # tidy punctuation spacing; keep sentence punctuation, strip noise later
+    text = re.sub(r"[^\w\s\.\!\?\'/:-]", " ", text)  # keep a modest set of marks
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
-# ------------------------------------------------------
-# 3. Lemmatization
-def lemmatize_text(text):
+def lemmatize_keep_negations(text: str) -> str:
+    """
+    Lemmatize and drop stopwords EXCEPT negations.
+    """
     doc = nlp(text)
-    return " ".join([token.lemma_ for token in doc if not token.is_stop])
+    out = []
+    for tok in doc:
+        if tok.is_space:
+            continue
+        lemma = tok.lemma_.strip()
+        if not lemma:
+            continue
+        # keep if not a stopword OR it's a negation
+        if (not tok.is_stop) or (lemma in NEGATIONS or tok.lower_ in NEGATIONS):
+            out.append(lemma)
+    return " ".join(out)
 
-# ------------------------------------------------------
-# 4. Extract only customer utterances (optional)
-def extract_customer_only(text):
-    # Keep only lines after 'Customer' labels
-    lines = text.split("\n")
-    customer_lines = [re.sub(r"Customer\s*[:\-]?\s*", "", l, flags=re.IGNORECASE) 
-                      for l in lines if l.strip().lower().startswith("customer")]
-    return " ".join(customer_lines) if customer_lines else text
-
-# ------------------------------------------------------
-# Full preprocessing pipeline
-def preprocess_transcript(text, customer_only=True):
-    if pd.isna(text):
-        return ""
+def assemble_text(segments, customer_only: bool, keep_turns: bool) -> str:
     if customer_only:
-        text = extract_customer_only(text)
-    text = remove_speaker_labels(text)
-    text = normalize_text(text)
-    text = lemmatize_text(text)
+        utts = [u for s,u in segments if s == "CUSTOMER"]
+        if keep_turns:
+            return SEP_TOKEN.join(utts)
+        return " ".join(utts)
+    else:
+        utts = [u for _,u in segments]
+        if keep_turns:
+            return SEP_TOKEN.join(utts)
+        return " ".join(utts)
+
+# ---------- Main per-transcript pipeline ----------
+def preprocess_transcript(raw_text: str,
+                          customer_only: bool = True,
+                          keep_turns: bool = True,
+                          remove_fillers_flag: bool = True,
+                          do_lemmatize: bool = True) -> str:
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        return ""
+
+    t = normalize_unicode(raw_text)
+    t = scrub_bracketed(t)            # remove [PII] etc.
+    t = collapse_stutters(t)
+    segments = split_by_speaker(t)    # [(speaker, text), ...]
+    t = assemble_text(segments, customer_only=customer_only, keep_turns=keep_turns)
+
+    # Clean disfluencies and normalize
+    if remove_fillers_flag:
+        t = remove_fillers(t)
+    t = basic_normalize(t)
+
+    # Final lemmatization
+    if do_lemmatize:
+        t = lemmatize_keep_negations(t)
+
+    # One last whitespace squeeze
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+# ---------- Batch processing for a DataFrame ----------
+def preprocess_dataframe(df: pd.DataFrame,
+                         transcript_col: str = "transcript") -> pd.DataFrame:
+    """
+    Adds:
+      - clean_customer_only   (customer text, turns preserved)
+      - clean_all_turns       (agent+customer, turns preserved)
+    """
+    texts = df[transcript_col].fillna("").astype(str).tolist()
+
+    # Build both variants without re-loading spaCy repeatedly
+    clean_customer = [preprocess_transcript(t, customer_only=True, keep_turns=True,
+                                            remove_fillers_flag=True, do_lemmatize=True)
+                      for t in texts]
+    clean_all = [preprocess_transcript(t, customer_only=False, keep_turns=True,
+                                       remove_fillers_flag=True, do_lemmatize=True)
+                 for t in texts]
+
+    out = df.copy()
+    out["clean_customer_only"] = clean_customer
+    out["clean_all_turns"] = clean_all
+    return out
+
+# ---------- Example (replace with your df) ----------
+# df = pd.DataFrame({"transcript":[RAW_SAMPLE_TEXT], "materiality":["COMPLAINT"]})
+# df = preprocess_dataframe(df)
+# df[["clean_customer_only","clean_all_turns"]].head()
+
+
+
+def tag_money(text: str) -> str:
+    """
+    Replace currency amounts and percentages with [MONEY].
+    Examples:
+      '£500' -> '[MONEY]'
+      '$1200.50' -> '[MONEY]'
+      '2000 INR' -> '[MONEY]'
+      '5%' -> '[MONEY]'
+    """
+    # Currency + numbers (€, £, $, INR etc.)
+    text = re.sub(r"(\£|\$|\€)\s*\d+([.,]\d+)?", " [MONEY] ", text)
+    text = re.sub(r"\d+\s*(rs|inr|usd|eur|gbp)", " [MONEY] ", text, flags=re.IGNORECASE)
+    # Percentages
+    text = re.sub(r"\d+(\.\d+)?\s*%", " [MONEY] ", text)
     return text
 
-# ------------------------------------------------------
-# Apply pipeline
-df["clean_transcript"] = df["transcript"].apply(lambda x: preprocess_transcript(x, customer_only=True))
 
-print(df[["transcript", "clean_transcript", "materiality"]].head(2))
+def preprocess_transcript(raw_text: str,
+                          customer_only: bool = True,
+                          keep_turns: bool = True,
+                          remove_fillers_flag: bool = True,
+                          do_lemmatize: bool = True) -> str:
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        return ""
 
+    t = normalize_unicode(raw_text)
+    t = scrub_bracketed(t)
+    t = collapse_stutters(t)
+    segments = split_by_speaker(t)
+    t = assemble_text(segments, customer_only=customer_only, keep_turns=keep_turns)
 
-⸻
+    if remove_fillers_flag:
+        t = remove_fillers(t)
+    t = basic_normalize(t)
+    t = tag_money(t)   # <---- NEW STEP
 
-What this does
-	•	Removes speaker tags: “Agent:” / “Customer:”
-	•	Keeps only customer text (optional but useful since dissatisfaction originates there).
-	•	Lowercases + strips punctuation/numbers.
-	•	Lemmatizes words (turns calling → call, complaints → complaint).
-	•	Removes stopwords like “the, is, are”.
+    if do_lemmatize:
+        t = lemmatize_keep_negations(t)
 
-⸻
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
-👉 Question for you: Do you want to keep conversational flow (both Agent + Customer) or restrict strictly to customer text for training?
-Because if the model needs context (like agent apologizing), we keep both. If not, we strip down to customer only.
