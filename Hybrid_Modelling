@@ -3,22 +3,21 @@
 """
 Hybrid 3-class classifier (Complaint, Concern, Neutral) for call transcripts.
 
+Now supports CSV and Excel:
+- Input auto-detected by extension (.csv, .xlsx, .xls)
+- Optional SHEET_NAME for Excel
+- Inference output writes .xlsx if output filename ends with .xlsx (otherwise .csv)
+
 Pipeline
 --------
-1) (Optional) Lightweight text preprocessing helpers included for reuse.
-2) Build data-driven keyword clusters from TRAIN split using TF-IDF n-grams,
-   expanded via sentence embedding similarity to seed phrases.
-3) Compute pooled sentence embeddings for each transcript (chunked).
-4) Create rule features (loudness, AWS sentiment -5..+5, keyword hits, semantic sims).
-5) Train multinomial Logistic Regression on fused features (embeddings + numeric + rules).
-6) Blend ML probabilities with rule one-hots for the final "hybrid" decision.
-7) Save artifacts; provide inference() for batch scoring.
+1) Build data-driven keyword clusters from TRAIN split (TF-IDF n-grams expanded by embedding similarity).
+2) Compute pooled sentence embeddings for each transcript (chunked).
+3) Create rule features (loudness, AWS sentiment -5..+5, keyword hits, semantic sims).
+4) Train multinomial Logistic Regression on fused features.
+5) Blend ML probabilities with rule one-hots for the final decision.
+6) Save artifacts + inference function.
 
-Notes
------
-- Expects materiality labels in {NEUTRAL, CONCERN, COMPLAINT}. Script normalizes
-  plural variants ("CONCERNS", "COMPLAINTS") and common null-like values.
-- Uses only customer_light/full_light text. Adjust column names below if needed.
+Requires: pandas, numpy, scikit-learn, sentence-transformers, openpyxl (for Excel).
 """
 
 # =========================
@@ -27,8 +26,6 @@ Notes
 import os
 import re
 import json
-import math
-import gc
 import joblib
 import numpy as np
 import pandas as pd
@@ -41,46 +38,64 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report
 
 from sentence_transformers import SentenceTransformer
-from numpy.linalg import norm
 
-# ----- Paths & Columns -----
-INPUT_CSV   = "input_transcripts.csv"         # ### CHANGE HERE
-OUTPUT_DIR  = "artifacts_hybrid_v1"           # ### CHANGE HERE
+# ----- Paths / Columns -----
+INPUT_FILE  = "input_transcripts.xlsx"   # <<< CHANGE HERE (xlsx/xls/csv)
+SHEET_NAME  = None                       # <<< CHANGE HERE if your Excel has a specific sheet (e.g., "Sheet1")
+OUTPUT_DIR  = "artifacts_hybrid_v1"      # <<< CHANGE HERE
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-COL_TEXT_CUST   = "customer_light"            # ### CHANGE HERE if your text lives elsewhere
-COL_TEXT_FULL   = "full_light"                # optional fallback
-COL_LABEL       = "materiality"               # values: NEUTRAL / CONCERN / COMPLAINT (script normalizes)
-COL_LOUDNESS    = "loudnessscore"             # numeric (e.g., 0..100 or %)
-COL_SENTIMENT   = "Max negative customer score"  # AWS Contact Lens sentiment (-5..+5)
+COL_TEXT_CUST   = "customer_light"       # <<< CHANGE HERE if needed
+COL_TEXT_FULL   = "full_light"           # optional fallback
+COL_LABEL       = "materiality"          # values: NEUTRAL / CONCERN / COMPLAINT (script normalizes)
+COL_LOUDNESS    = "loudnessscore"
+COL_SENTIMENT   = "Max negative customer score"  # AWS Contact Lens (-5..+5)
 
-# ----- Random seed / model -----
+# ----- Model / thresholds -----
 RANDOM_SEED     = 42
-EMBED_MODEL     = "sentence-transformers/all-mpnet-base-v2"  # ### CHANGE HERE if you prefer another
+EMBED_MODEL     = "sentence-transformers/all-mpnet-base-v2"  # <<< CHANGE if you prefer
 MAX_CHARS_CHUNK = 1000
 
-# ----- Rule thresholds (tune) -----
-LOUD_HIGH_TH     = 96.0      # loudness above this is "high"
-SENT_STRONG_NEG  = -3.0      # <= strong negative -> complaint-ish
-SENT_MOD_NEG_MAX = 0.0       # (-3, 0] -> concern-ish
-NEU_POS_TH       = 0.5       # >= positive-ish sentiment -> neutral-ish
+LOUD_HIGH_TH     = 96.0
+SENT_STRONG_NEG  = -3.0
+SENT_MOD_NEG_MAX = 0.0
+NEU_POS_TH       = 0.5
 
-# ----- Keyword / similarity settings -----
 TFIDF_NGRAM      = (1, 3)
 TFIDF_MAX_FEAT   = 30000
 TOP_K_CANDIDATES = 4000
 TOP_K_PER_CLASS  = 200
-SIM_THRESHOLD    = 0.35      # centroid similarity threshold used in rule gating
+SIM_THRESHOLD    = 0.35
 
-# ----- Blending weight (rules + ML probs) -----
 ALPHA_RULE_BLEND = 0.55
 
-# ----- Labels -----
 LABEL2ID = {"NEUTRAL": 0, "CONCERN": 1, "COMPLAINT": 2}
 ID2LABEL = {v: k for k, v in LABEL2ID.items()}
 
 # =========================
-# Minimal text helpers (optional reuse)
+# IO helpers (CSV/Excel)
+# =========================
+def read_table(path: str, sheet: Optional[str] = None) -> pd.DataFrame:
+    low = path.lower()
+    if low.endswith(".csv"):
+        return pd.read_csv(path)
+    if low.endswith(".xlsx") or low.endswith(".xls"):
+        # requires openpyxl (xlsx) or xlrd (xls). Prefer openpyxl engine.
+        return pd.read_excel(path, sheet_name=sheet, engine="openpyxl")
+    raise ValueError(f"Unsupported file type: {path}")
+
+def write_table(df: pd.DataFrame, path: str) -> None:
+    low = path.lower()
+    if low.endswith(".xlsx") or low.endswith(".xls"):
+        df.to_excel(path, index=False, engine="openpyxl")
+    elif low.endswith(".csv"):
+        df.to_csv(path, index=False)
+    else:
+        # default to CSV if no extension recognized
+        df.to_csv(path if "." in path else path + ".csv", index=False)
+
+# =========================
+# Minimal text helpers
 # =========================
 def chunk_text(text: str, max_chars: int = MAX_CHARS_CHUNK) -> List[str]:
     t = (text or "").strip()
@@ -130,12 +145,11 @@ def prepare_labels(df: pd.DataFrame, label_col: str = COL_LABEL) -> np.ndarray:
     return y.map(LABEL2ID).values
 
 # =========================
-# Keyword discovery (data-driven)
+# Keyword discovery
 # =========================
+from sklearn.feature_extraction.text import TfidfVectorizer
+
 def build_candidate_phrases(texts: List[str]) -> List[str]:
-    """
-    Surface candidate 1..3-gram phrases via TF-IDF from TRAIN ONLY.
-    """
     tfidf = TfidfVectorizer(
         max_features=TFIDF_MAX_FEAT,
         ngram_range=TFIDF_NGRAM,
@@ -146,11 +160,9 @@ def build_candidate_phrases(texts: List[str]) -> List[str]:
     )
     X = tfidf.fit_transform(texts)
     vocab = np.array(tfidf.get_feature_names_out())
-    # global importance proxy: sum tfidf per feature
     scores = np.asarray(X.sum(axis=0)).ravel()
     idx = np.argsort(scores)[::-1]
     top = vocab[idx][:TOP_K_CANDIDATES]
-    # prune very short & pure stopword terms
     cleaned = []
     for p in top:
         if len(p) < 3:
@@ -161,21 +173,20 @@ def build_candidate_phrases(texts: List[str]) -> List[str]:
         cleaned.append(" ".join(tokens))
     return cleaned[:TOP_K_CANDIDATES]
 
+from sentence_transformers import SentenceTransformer
+
 def expand_keywords_by_similarity(
     model: SentenceTransformer,
     candidates: List[str],
     seed_phrases: List[str],
     top_k: int = TOP_K_PER_CLASS
 ) -> Tuple[List[str], np.ndarray]:
-    """
-    Return top_k candidate phrases closest to the seed centroid and their embeddings (L2-normalized).
-    """
     if not candidates:
         return [], np.zeros((0, model.get_sentence_embedding_dimension()), dtype=np.float32)
     seed_embs = model.encode(seed_phrases, convert_to_numpy=True, normalize_embeddings=True, batch_size=64)
     centroid = seed_embs.mean(axis=0)
     cand_embs = model.encode(candidates, convert_to_numpy=True, normalize_embeddings=True, batch_size=256)
-    sims = cand_embs @ centroid  # cosine since normalized
+    sims = cand_embs @ centroid
     top_idx = np.argsort(sims)[::-1][:top_k]
     return [candidates[i] for i in top_idx], cand_embs[top_idx]
 
@@ -183,9 +194,6 @@ def expand_keywords_by_similarity(
 # Embeddings & Features
 # =========================
 def embed_transcript(model: SentenceTransformer, text: str) -> np.ndarray:
-    """
-    Encode transcript chunks, average (mean pooling), return L2-normalized vector.
-    """
     chunks = chunk_text(text)
     if not chunks:
         return np.zeros(model.get_sentence_embedding_dimension(), dtype=np.float32)
@@ -202,20 +210,14 @@ def build_feature_matrix(
     scaler: Optional[MinMaxScaler] = None,
     fit_scaler: bool = False
 ) -> Tuple[np.ndarray, np.ndarray, MinMaxScaler]:
-    """
-    Returns:
-      X       : fused features [embeddings | scaled numeric | rule flags]
-      metaCols: list of names for non-embedding features
-      scaler  : fitted MinMaxScaler
-    """
     texts = text_series(df).tolist()
     N = len(texts)
 
-    # 1) Embeddings
+    # Embeddings
     emb_list = [embed_transcript(model, t) for t in texts]
-    E = np.vstack(emb_list)  # (N, d) already normalized
+    E = np.vstack(emb_list)  # (N, d)
 
-    # 2) Keyword counts
+    # Keyword counts
     def count_hits(s: str, kws: List[str]) -> int:
         s_low = s.lower()
         return sum(1 for k in kws if k in s_low)
@@ -223,7 +225,7 @@ def build_feature_matrix(
     comp_counts = np.array([count_hits(t, comp_kw) for t in texts], dtype=np.float32)
     con_counts  = np.array([count_hits(t, con_kw)  for t in texts], dtype=np.float32)
 
-    # 3) Semantic similarity to keyword centroids
+    # Semantic similarity to keyword centroids
     def centroid(embs: np.ndarray) -> np.ndarray:
         if embs.size == 0:
             return np.zeros(E.shape[1], dtype=np.float32)
@@ -242,23 +244,21 @@ def build_feature_matrix(
     sims_comp = safe_cosine_to_centroid(E, comp_centroid)
     sims_con  = safe_cosine_to_centroid(E, con_centroid)
 
-    # 4) Numeric inputs
+    # Numeric inputs
     loud = df.get(COL_LOUDNESS, pd.Series([0]*N)).astype(float).values.astype(np.float32)
     sent = df.get(COL_SENTIMENT, pd.Series([0]*N)).astype(float).values.astype(np.float32)
 
-    # 5) Rules
+    # Rule flags
     rule_complaint = ((loud > LOUD_HIGH_TH) & (sent <= SENT_STRONG_NEG) &
                       ((comp_counts > 0) | (sims_comp >= SIM_THRESHOLD))).astype(np.float32)
-
     rule_concern   = ((sent > SENT_STRONG_NEG) & (sent <= SENT_MOD_NEG_MAX) &
                       ((con_counts > 0) | (sims_con >= SIM_THRESHOLD))).astype(np.float32)
-
     rule_neutral   = ((sent >= NEU_POS_TH) &
                       (comp_counts + con_counts == 0) &
                       (sims_comp < SIM_THRESHOLD) &
                       (sims_con  < SIM_THRESHOLD)).astype(np.float32)
 
-    # 6) Scale numeric block (not embeddings)
+    # Scale numeric block
     numeric = np.vstack([loud, sent, comp_counts, con_counts, sims_comp, sims_con]).T  # (N, 6)
     if scaler is None:
         scaler = MinMaxScaler()
@@ -267,7 +267,7 @@ def build_feature_matrix(
         scaler.fit(numeric)
     numeric_scaled = scaler.transform(numeric).astype(np.float32)
 
-    # 7) Final fused feature vector
+    # Fuse
     X = np.hstack([
         E,
         numeric_scaled,
@@ -285,14 +285,9 @@ def build_feature_matrix(
     return X, meta_cols, scaler
 
 def build_rule_onehot(rule_neu: np.ndarray, rule_con: np.ndarray, rule_comp: np.ndarray) -> np.ndarray:
-    # one-hot-like rows (may have multiple 1s if multiple rules fire)
     return np.vstack([rule_neu, rule_con, rule_comp]).T.astype(np.float32)
 
 def blended_predict_proba(clf: LogisticRegression, X: np.ndarray, rule_flags: np.ndarray, alpha: float = ALPHA_RULE_BLEND) -> np.ndarray:
-    """
-    Blend ML probabilities with rule one-hots:
-      blended = softmax( p_ml + alpha * rule )
-    """
     proba = clf.predict_proba(X)
     rf = rule_flags.astype(np.float32)
     blended = proba + alpha * rf
@@ -303,19 +298,19 @@ def blended_predict_proba(clf: LogisticRegression, X: np.ndarray, rule_flags: np
 # Training / Evaluation
 # =========================
 def main():
-    # Load
-    df = pd.read_csv(INPUT_CSV)
+    # Load table (CSV or Excel)
+    df = read_table(INPUT_FILE, sheet=SHEET_NAME)
 
     # Basic checks
     for col in (COL_LABEL, COL_TEXT_CUST, COL_SENTIMENT, COL_LOUDNESS):
         if col not in df.columns:
             raise KeyError(f"Missing required column: {col}")
 
-    # Normalize labels, filter to valid set
+    # Normalize labels, filter valid
     normalize_labels_inplace(df, COL_LABEL)
     df = df[df[COL_LABEL].isin(LABEL2ID.keys())].reset_index(drop=True)
 
-    # 70/15/15 split (stratified)
+    # Stratified split 70/15/15
     train_df, test_df = train_test_split(
         df, test_size=0.15, random_state=RANDOM_SEED, stratify=df[COL_LABEL]
     )
@@ -323,14 +318,14 @@ def main():
         train_df, test_size=0.1765, random_state=RANDOM_SEED, stratify=train_df[COL_LABEL]
     )
 
-    # Show distribution (sanity)
+    # Show label distribution
     for name, d in [("train", train_df), ("val", val_df), ("test", test_df)]:
         print(name, d[COL_LABEL].value_counts().to_dict())
 
     # Embedding model
     model = SentenceTransformer(EMBED_MODEL)
 
-    # === Build data-driven keyword lists from TRAIN ONLY ===
+    # Data-driven keywords from TRAIN
     train_texts = text_series(train_df).tolist()
 
     complaint_seeds = [
@@ -354,7 +349,7 @@ def main():
     with open(os.path.join(OUTPUT_DIR, "concern_keywords.json"), "w") as f:
         json.dump(con_kw, f, indent=2)
 
-    # === Build features ===
+    # Features
     X_train, meta_cols, scaler = build_feature_matrix(model, train_df, comp_kw, comp_kw_emb, con_kw, con_kw_emb, scaler=None, fit_scaler=True)
     X_val,   _,        _      = build_feature_matrix(model, val_df,   comp_kw, comp_kw_emb, con_kw, con_kw_emb, scaler=scaler, fit_scaler=False)
     X_test,  _,        _      = build_feature_matrix(model, test_df,  comp_kw, comp_kw_emb, con_kw, con_kw_emb, scaler=scaler, fit_scaler=False)
@@ -363,30 +358,27 @@ def main():
     y_val   = prepare_labels(val_df)
     y_test  = prepare_labels(test_df)
 
-    # Extract rule flags (last 3 columns in X are rule_comp, rule_con, rule_neu)
+    # Rule flags from fused X (last 3 columns)
     def split_rule_flags(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         rule_comp = X[:, -3]
         rule_con  = X[:, -2]
         rule_neu  = X[:, -1]
         return rule_neu, rule_con, rule_comp
 
-    rneu_tr, rcon_tr, rcomp_tr = split_rule_flags(X_train)
     rneu_va, rcon_va, rcomp_va = split_rule_flags(X_val)
     rneu_te, rcon_te, rcomp_te = split_rule_flags(X_test)
 
-    # =========================
-    # Train multinomial LR on fused features
-    # =========================
+    # Train classifier
     clf = LogisticRegression(
         max_iter=1500,
         class_weight="balanced",
-        multi_class="auto",      # quiets sklearn deprecation
+        multi_class="auto",
         solver="lbfgs",
         random_state=RANDOM_SEED
     )
     clf.fit(X_train, y_train)
 
-    # ---- Pure ML reports ----
+    # Pure ML
     print("\n=== Pure ML (no blending) ===")
     y_pred_val = clf.predict(X_val)
     print("Validation:")
@@ -405,7 +397,7 @@ def main():
         zero_division=0
     ))
 
-    # ---- Hybrid blending (rules + ML probs) ----
+    # Hybrid (blend rules + ML)
     print("\n=== Hybrid (ML + rule blending) ===")
     rule_onehot_val = build_rule_onehot(rneu_va, rcon_va, rcomp_va)
     rule_onehot_tst = build_rule_onehot(rneu_te, rcon_te, rcomp_te)
@@ -431,9 +423,7 @@ def main():
         zero_division=0
     ))
 
-    # =========================
     # Save artifacts
-    # =========================
     joblib.dump(clf, os.path.join(OUTPUT_DIR, "hybrid_logreg.joblib"))
     joblib.dump(scaler, os.path.join(OUTPUT_DIR, "numeric_scaler.joblib"))
     with open(os.path.join(OUTPUT_DIR, "meta_cols.json"), "w") as f:
@@ -444,28 +434,20 @@ def main():
         json.dump({"LABEL2ID": LABEL2ID, "ID2LABEL": ID2LABEL}, f, indent=2)
 
     print(f"\nArtifacts saved to: {OUTPUT_DIR}")
-    print(" - hybrid_logreg.joblib")
-    print(" - numeric_scaler.joblib")
-    print(" - complaint_keywords.json / concern_keywords.json")
-    print(" - meta_cols.json")
-    print(" - embed_model.txt")
-    print(" - label_mapping.json")
-
 
 # =========================
 # Inference (batch)
 # =========================
-def inference(input_csv: str,
+def inference(input_path: str,
               artifacts_dir: str = OUTPUT_DIR,
-              output_csv: str = "predictions_output.csv",
+              output_path: str = "predictions_output.xlsx",  # write Excel by default
               blend_with_rules: bool = True,
-              alpha: float = ALPHA_RULE_BLEND) -> pd.DataFrame:
-    """
-    Load artifacts and score a new CSV. Writes predictions with probabilities.
-    """
-    # Load data
-    df_new = pd.read_csv(input_csv)
-    normalize_labels_inplace(df_new, COL_LABEL)  # ok if label missing; we won't use it
+              alpha: float = ALPHA_RULE_BLEND,
+              sheet: Optional[str] = None) -> pd.DataFrame:
+    df_new = read_table(input_path, sheet=sheet)
+    # labels may be absent; normalize anyway for consistency
+    if COL_LABEL in df_new.columns:
+        normalize_labels_inplace(df_new, COL_LABEL)
 
     # Load artifacts
     clf = joblib.load(os.path.join(artifacts_dir, "hybrid_logreg.joblib"))
@@ -479,25 +461,22 @@ def inference(input_csv: str,
     with open(os.path.join(artifacts_dir, "concern_keywords.json"), "r") as f:
         con_kw = json.load(f)
 
-    # Recompute keyword centroid embeddings
-    # (Fast enough; avoids saving extra files.)
-    # If you want to cache, persist comp_kw_emb / con_kw_emb during training.
-    candidates_for_emb = comp_kw + con_kw
-    if candidates_for_emb:
-        all_embs = model.encode(candidates_for_emb, convert_to_numpy=True, normalize_embeddings=True, batch_size=256)
+    # Recompute keyword centroid embeddings (fast enough)
+    cand = comp_kw + con_kw
+    if cand:
+        all_embs = model.encode(cand, convert_to_numpy=True, normalize_embeddings=True, batch_size=256)
         comp_kw_emb = all_embs[:len(comp_kw)]
         con_kw_emb  = all_embs[len(comp_kw):]
     else:
         comp_kw_emb = np.zeros((0, model.get_sentence_embedding_dimension()), dtype=np.float32)
         con_kw_emb  = np.zeros((0, model.get_sentence_embedding_dimension()), dtype=np.float32)
 
-    # Build features
+    # Features
     X_new, _, _ = build_feature_matrix(model, df_new, comp_kw, comp_kw_emb, con_kw, con_kw_emb, scaler=scaler, fit_scaler=False)
 
     # Predict
     proba_ml = clf.predict_proba(X_new)
     if blend_with_rules:
-        # build rule one-hot from last 3 columns
         rule_comp = X_new[:, -3]
         rule_con  = X_new[:, -2]
         rule_neu  = X_new[:, -1]
@@ -509,21 +488,21 @@ def inference(input_csv: str,
     y_hat = np.argmax(proba, axis=1)
     preds = [ID2LABEL[i] for i in y_hat]
 
-    # Attach to dataframe
-    df_new["pred_class"] = preds
-    df_new["proba_NEUTRAL"]   = proba[:, 0]
-    df_new["proba_CONCERN"]   = proba[:, 1]
-    df_new["proba_COMPLAINT"] = proba[:, 2]
+    # Output
+    df_new["pred_class"]        = preds
+    df_new["proba_NEUTRAL"]     = proba[:, 0]
+    df_new["proba_CONCERN"]     = proba[:, 1]
+    df_new["proba_COMPLAINT"]   = proba[:, 2]
 
-    df_new.to_csv(output_csv, index=False)
-    print(f"Saved predictions to: {output_csv}")
+    write_table(df_new, output_path)
+    print(f"Saved predictions to: {output_path}")
     return df_new
-
 
 # =========================
 # Entrypoint
 # =========================
 if __name__ == "__main__":
     main()
-    # Example inference call (uncomment to run after training):
-    # inference("unseen_calls.csv", artifacts_dir=OUTPUT_DIR, output_csv="unseen_predictions.csv")
+    # Example inference calls:
+    # inference("unseen_calls.xlsx", artifacts_dir=OUTPUT_DIR, output_path="unseen_predictions.xlsx", sheet="Sheet1")
+    # inference("unseen_calls.csv", artifacts_dir=OUTPUT_DIR, output_path="unseen_predictions.csv")
