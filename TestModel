@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Training pipeline for 3-class classification (Complaint, Concern, Neutral) 
+using sparse and dense features.
+"""
+
+import os
+import re
+import unicodedata
+import pandas as pd
+import numpy as np
+import joblib
+from typing import Optional, Tuple, Dict, Any, List
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import MinMaxScaler, MultiLabelBinarizer
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
+from sklearn.linear_model import LogisticRegression
+
+from scipy import sparse as sp
+
+# Sentence embeddings
+from sentence_transformers import SentenceTransformer
+import torch
+
+# -----------------------------
+# Config / Column names
+# -----------------------------
+INPUT_CSV = "input_transcripts.csv"         # replace with your file
+OUTPUT_DIR = "artifacts"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+COL_CALL = "call_transcript"
+COL_CUSTOMER_LIGHT = "customer_light"
+COL_FULL_LIGHT = "full_light"
+COL_MATERIALITY = "materiality"             # values: CONCERN, COMPLAINT, or Neutral
+
+COL_LOUDNESS = "loudnessscore"
+COL_MAX_NEG = "Max negative customer score" # exact from screenshot (case sensitive)
+ALT_MAX_NEG = ["Max Negative Sentiment Score", "Max negative sentiment score"]
+
+SEP_TOKEN = "[SEP]"   # token used in preprocessing
+SEP_TOKEN_REGEX = r"\bsep\b"               # used to count speaker turns if needed
+
+EMBED_MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
+TFIDF_MAX_FEAT = 20000
+TFIDF_NGRAM = (1, 2)
+RANDOM_SEED = 42
+
+# -----------------------------
+# Preprocessing pipeline for transcripts
+# -----------------------------
+# Load spaCy once (for strict mode if used)
+import spacy
+nlp = spacy.load("en_core_web_sm", disable=["parser", "ner"])
+
+FILLER_WORDS = {
+    "um","uh","umm","uhh","erm","er","eh","hmm","mm","mmm","ah","oh","uhm","ya",
+    "yeahh","umhum","mhm","huh","ummm","hmmm"
+}
+FILLER_PHRASES = [
+    r"\byou know\b",
+    r"\bi mean\b",
+    r"\bkind of\b",
+    r"\bsort of\b",
+    r"\bto be honest\b",
+    r"\bto be fair\b",
+    r"\bif that makes sense\b"
+]
+NEGATIONS = {"no", "not", "never", "n't"}
+
+def normalize_unicode(text: str) -> str:
+    return unicodedata.normalize("NFKC", text)
+
+def scrub_bracketed(text: str) -> str:
+    return re.sub(r"\[[^\]]+\]", " ", text)   # remove [PII], [NAME], etc.
+
+def insert_speaker_delims(text: str) -> str:
+    t = re.sub(r"[\r\n]+", " ", text)
+    return re.sub(r"\b(AGENT|CUSTOMER)\b", r"||| \1", t)
+
+def split_by_speaker(text: str):
+    chunks = [c.strip() for c in insert_speaker_delims(text).split("|||") if c.strip()]
+    segments, current = [], None
+    for ch in chunks:
+        if ch.startswith("AGENT") or ch.startswith("CUSTOMER"):
+            spk = "AGENT" if ch.startswith("AGENT") else "CUSTOMER"
+            content = ch[len(spk):].strip(" :-\t")
+            if content:
+                segments.append((spk, content))
+            current = spk
+        else:
+            if current:
+                segments.append((current, ch))
+            else:
+                segments.append(("UNK", ch))
+    return segments
+
+def collapse_stutters(text: str) -> str:
+    text = re.sub(r"\b(\w+)\s*[-–—]{1,2}\s*\1\b", r"\1", text)
+    text = re.sub(r"\b(\w+)\s+\1\b", r"\1", text)
+    text = re.sub(r"(.)\1{2,}", r"\1\1", text)  # soooo -> soo
+    return text
+
+def remove_fillers(text: str) -> str:
+    for pat in FILLER_PHRASES:
+        text = re.sub(pat, " ", text, flags=re.IGNORECASE)
+    if FILLER_WORDS:
+        pat = r"\b(" + "|".join(re.escape(w) for w in sorted(FILLER_WORDS, key=len, reverse=True)) + r")\b"
+        text = re.sub(pat, " ", text, flags=re.IGNORECASE)
+    return text
+
+def basic_normalize(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"[^\w\s\.\!\?\'/:-]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+def tag_money(text: str) -> str:
+    text = re.sub(r"(\£|\$|\€)\s*\d+([.,]\d+)?", " [MONEY] ", text)
+    text = re.sub(r"\d+\s*(rs|inr|usd|eur|gbp)", " [MONEY] ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\d+(\.\d+)?\s*%", " [MONEY] ", text)
+    return text
+
+def lemmatize_keep_negations(text: str) -> str:
+    doc = nlp(text)
+    out = []
+    for tok in doc:
+        if tok.is_space:
+            continue
+        if tok.text.startswith("[") and tok.text.endswith("]"):
+            out.append(tok.text)
+            continue
+        lemma = tok.lemma_.strip()
+        if not lemma:
+            continue
+        if (not tok.is_stop) or (lemma in NEGATIONS or tok.lower_ in NEGATIONS):
+            out.append(lemma)
+    return " ".join(out)
+
+def assemble_text(segments, customer_only, keep_turns, keep_speakers=False):
+    utts = []
+    for spk, u in segments:
+        if customer_only and spk != "CUSTOMER":
+            continue
+        if keep_speakers:
+            utts.append(f"{spk}: {u}")
+        else:
+            utts.append(u)
+    return f" {SEP_TOKEN} ".join(utts) if keep_turns else " ".join(utts)
+
+def preprocess_transcript(raw_text: str,
+                          mode: str = "light",
+                          customer_only: bool = False,
+                          keep_turns: bool = True,
+                          keep_speakers: bool = False) -> str:
+    """
+    mode = "light" -> minimal cleanup (readable, for embeddings)
+    mode = "strict" -> aggressive lemmatization + stopword removal
+    """
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        return ""
+    t = normalize_unicode(raw_text)
+    t = scrub_bracketed(t)
+    t = collapse_stutters(t)
+    segments = split_by_speaker(t)
+    t = assemble_text(segments, customer_only=customer_only, keep_turns=keep_turns, keep_speakers=keep_speakers)
+    t = remove_fillers(t)
+    t = basic_normalize(t)
+    t = tag_money(t)
+    if mode == "strict":
+        t = lemmatize_keep_negations(t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+def preprocess_dataframe(df: pd.DataFrame,
+                         transcript_col_full: str = "transcripts",
+                         transcript_col_cust: str = "Customer transcript") -> pd.DataFrame:
+    """
+    Adds four new columns:
+      - full_light, full_strict
+      - customer_light, customer_strict
+    """
+    texts_full = df[transcript_col_full].fillna("").astype(str).tolist()
+    texts_cust = df[transcript_col_cust].fillna("").astype(str).tolist() if transcript_col_cust in df.columns else [""] * len(df)
+    out = df.copy()
+    out["full_light"] = [preprocess_transcript(t, mode="light", customer_only=False, keep_turns=True, keep_speakers=False) for t in texts_full]
+    out["full_strict"] = [preprocess_transcript(t, mode="strict", customer_only=False, keep_turns=True, keep_speakers=False) for t in texts_full]
+    out["customer_light"] = [preprocess_transcript(t, mode="light", customer_only=True, keep_turns=True, keep_speakers=False) for t in texts_cust]
+    out["customer_strict"] = [preprocess_transcript(t, mode="strict", customer_only=True, keep_turns=True, keep_speakers=False) for t in texts_cust]
+    return out
+
+# -----------------------------
+# Helper functions for features
+# -----------------------------
+def pick_max_neg_col(df: pd.DataFrame) -> Optional[str]:
+    if COL_MAX_NEG in df.columns:
+        return COL_MAX_NEG
+    for alt in ALT_MAX_NEG:
+        if alt in df.columns:
+            return alt
+    return None
+
+def choose_text_series(df: pd.DataFrame) -> pd.Series:
+    """Prefer customer_light; fallback to full_light or call_transcript."""
+    for c in (COL_CUSTOMER_LIGHT, COL_FULL_LIGHT, COL_CALL):
+        if c in df.columns:
+            s = df[c].fillna("").astype(str)
+            if s.str.strip().str.len().sum() > 0:
+                return s
+    raise KeyError("No suitable text column found (need customer_light/full_light/call_transcript).")
+
+def chunk_text(text: str, max_chars: int = 1000) -> List[str]:
+    if not isinstance(text, str) or not text.strip():
+        return []
+    return [text[i:i+max_chars] for i in range(0, len(text), max_chars)]
+
+def count_occurrences(pattern: str, text: str) -> int:
+    if not isinstance(text, str) or not text:
+        return 0
+    return len(re.findall(pattern, text))
+
+def count_money_mentions(text: str) -> int:
+    if not isinstance(text, str) or not text:
+        return 0
+    return len(re.findall(r"\[?money\]?", text, flags=re.IGNORECASE))
+
+CATEGORY_KEYWORDS = {
+    "Refund": ["refund", "money back", "reimbursement", "return my money"],
+    "Disconnection": ["disconnect", "cut off", "call drop", "line cut"],
+    "Complaint": ["complaint", "issue", "problem", "escalate", "dissatisfied", "disgraceful"],
+    "Concern": ["concern", "worry", "not happy", "doubt", "hesitation"],
+    "Payment Issue": ["payment failed", "transaction declined", "billing error", "charged twice"],
+    "Technical Issue": ["technical error", "system down", "bug", "glitch", "login"],
+    "Fraud/Security": ["fraud", "unauthorized", "hacked", "phishing", "scam"],
+    "General Query": ["information", "clarify", "know more", "details"],
+    "Positive Mention": ["happy", "good service", "satisfied", "thank you"],
+}
+
+def tag_keywords(text: str) -> List[str]:
+    if not isinstance(text, str) or not text:
+        return []
+    txt = text.lower()
+    tags = []
+    for k, kws in CATEGORY_KEYWORDS.items():
+        if any(kw in txt for kw in kws):
+            tags.append(k)
+    return tags
+
+# -----------------------------
+# Feature engineering class
+# -----------------------------
+class FEEngine:
+    def __init__(self,
+                 tfidf_max_features: int = TFIDF_MAX_FEAT,
+                 tfidf_ngram: Tuple[int, int] = TFIDF_NGRAM,
+                 embed_model_name: str = EMBED_MODEL_NAME,
+                 compute_sentiment_auto: bool = False,
+                 device: Optional[str] = None):
+        self.tfidf_max_features = tfidf_max_features
+        self.tfidf_ngram = tfidf_ngram
+        self.embed_model_name = embed_model_name
+        self.compute_sentiment_auto = compute_sentiment_auto
+        self.device = device if device else ("cuda" if torch.cuda.is_available() else "cpu")
+        self.tfidf = None
+        self.mlb = None
+        self.scaler = None
+        self.emb_model = None
+        self._fitted = False
+
+    def _structural(self, df: pd.DataFrame) -> pd.DataFrame:
+        cust = df.get(COL_CUSTOMER_LIGHT, pd.Series([""] * len(df))).fillna("").astype(str)
+        full = df.get(COL_FULL_LIGHT, pd.Series([""] * len(df))).fillna("").astype(str)
+        out = pd.DataFrame(index=df.index)
+        out["cust_tokens"] = cust.str.split().apply(lambda x: len(x) if isinstance(x, list) else 0)
+        out["full_tokens"] = full.str.split().apply(lambda x: len(x) if isinstance(x, list) else 0)
+        out["type_token_ratio"] = cust.str.split().apply(lambda x: len(set(x)) / (len(x) + 1e-6) if isinstance(x, list) and x else 0.0)
+        out["cust_turns"] = cust.apply(lambda x: count_occurrences(SEP_TOKEN_REGEX, x) + 1 if x.strip() else 0)
+        out["full_turns"] = full.apply(lambda x: count_occurrences(SEP_TOKEN_REGEX, x) + 1 if x.strip() else 0)
+        out["cust_avg_turn_len"] = out.apply(lambda r: r["cust_tokens"] / max(r["cust_turns"], 1), axis=1)
+        out["full_avg_turn_len"] = out.apply(lambda r: r["full_tokens"] / max(r["full_turns"], 1), axis=1)
+        out["qmarks"] = full.str.count(r"\?")
+        out["exclaims"] = full.str.count(r"\!")
+        out["money_mentions"] = cust.apply(count_money_mentions)
+        out["kw_complaint_hits"] = cust.str.count(r"\bcomplain\w*|\bdissatisf\w*|\bissue\b")
+        out["kw_concern_hits"] = cust.str.count(r"\bconcern\w*|\bworr\w*|\bnot happy\b")
+        out["kw_fraud_hits"] = cust.str.count(r"\bfraud\w*|\bunauthori\w*|\bscam\w*|\bhack\w*")
+        return out.fillna(0.0)
+
+    def _numeric(self, df: pd.DataFrame) -> pd.DataFrame:
+        cols = {}
+        # max negative sentiment column
+        maxneg = pick_max_neg_col(df)
+        if maxneg:
+            cols["max_neg"] = pd.to_numeric(df[maxneg].astype(str).str.replace(r"[^\d\-\.\+eE]", "", regex=True), errors="coerce").fillna(0.0)
+        else:
+            cols["max_neg"] = pd.Series(0.0, index=df.index)
+        # loudness if present
+        if COL_LOUDNESS in df.columns:
+            cols["loudnessscore"] = pd.to_numeric(df[COL_LOUDNESS], errors="coerce").fillna(0.0)
+        else:
+            cols["loudnessscore"] = pd.Series(0.0, index=df.index)
+        # total cost-like columns
+        for c in ["Total cost", "Total Cost", "TotalCost"]:
+            if c in df.columns:
+                cols["total_cost"] = pd.to_numeric(df[c].astype(str).str.replace(r"[^\d\.]", "", regex=True), errors="coerce").fillna(0.0)
+                break
+        if "total_cost" not in cols:
+            cols["total_cost"] = pd.Series(0.0, index=df.index)
+        return pd.DataFrame(cols, index=df.index)
+
+    def fit(self, df: pd.DataFrame):
+        # Text series
+        texts = choose_text_series(df)
+        # TF-IDF
+        self.tfidf = TfidfVectorizer(max_features=self.tfidf_max_features,
+                                     ngram_range=self.tfidf_ngram,
+                                     token_pattern=r"(?u)\b\w+\b")
+        _ = self.tfidf.fit_transform(texts.fillna(""))
+        # MultiLabelBinarizer for keyword tags
+        self.mlb = MultiLabelBinarizer()
+        _ = self.mlb.fit([tag_keywords(t) for t in texts.fillna("")])
+        # Fit scaler on numeric features (structural + numeric; skip sentiment if not used)
+        struct = self._structural(df)
+        numeric = self._numeric(df)
+        # If not computing sentiment, use zeros
+        sent = pd.DataFrame({"roberta_neg": 0.0, "roberta_neu": 0.0, "roberta_pos": 0.0}, index=df.index)
+        scale_block = pd.concat([numeric, sent], axis=1).fillna(0.0)
+        self.scaler = MinMaxScaler()
+        _ = self.scaler.fit(scale_block.values)
+        # Prepare embedding model
+        self.emb_model = SentenceTransformer(self.embed_model_name, device=self.device)
+        self._fitted = True
+        return self
+
+    def transform(self, df: pd.DataFrame) -> Dict[str, Any]:
+        if not self._fitted:
+            raise RuntimeError("FEEngine not fitted yet. Call fit() first.")
+        texts = choose_text_series(df)
+        # TF-IDF transform
+        X_tfidf = self.tfidf.transform(texts.fillna(""))
+        # Structural and numeric
+        struct = self._structural(df)
+        numeric = self._numeric(df)
+        # Sentiment - not used, just zeros
+        sent = pd.DataFrame({"roberta_neg": 0.0, "roberta_neu": 0.0, "roberta_pos": 0.0}, index=df.index)
+        # scale numeric+sentiment
+        scale_block = pd.concat([numeric, sent], axis=1).fillna(0.0)
+        scaled_vals = pd.DataFrame(self.scaler.transform(scale_block.values), index=df.index, columns=scale_block.columns)
+        # Keyword multi-hot tags
+        tags = [tag_keywords(t) for t in texts.fillna("")]
+        tag_m = self.mlb.transform(tags)
+        tag_df = pd.DataFrame(tag_m, index=df.index, columns=[f"tag_{c}" for c in self.mlb.classes_])
+        # Meta dataframe: scaled numeric + structural + tags
+        meta_df = pd.concat([scaled_vals, struct, tag_df], axis=1).fillna(0.0)
+        # Build sparse matrix: TF-IDF + meta
+        X_sparse = sp.hstack([X_tfidf, sp.csr_matrix(meta_df.values)], format="csr")
+        # Embeddings (sentence-transformers)
+        model = self.emb_model or SentenceTransformer(self.embed_model_name, device=self.device)
+        embs = []
+        for t in texts.tolist():
+            chunks = chunk_text(t, max_chars=1000)
+            if not chunks:
+                embs.append(np.zeros(model.get_sentence_embedding_dimension(), dtype=np.float32))
+                continue
+            vecs = model.encode(chunks, convert_to_tensor=True, show_progress_bar=False)
+            emb = vecs.mean(dim=0).cpu().numpy()
+            embs.append(emb)
+        embs = np.vstack(embs).astype(np.float32)
+        X_dense = np.hstack([embs, meta_df.values.astype(np.float32)])
+        # Targets
+        if COL_MATERIALITY in df.columns:
+            mat = df[COL_MATERIALITY].fillna("NEUTRAL").astype(str).str.upper().str.strip()
+            map3 = {"NEUTRAL": 0, "CONCERN": 1, "COMPLAINT": 2}
+            y_multiclass = mat.map(map3).astype("Int64")
+        else:
+            y_multiclass = pd.Series([pd.NA] * len(df), index=df.index, dtype="Int64")
+        return {
+            "X_sparse": X_sparse,
+            "X_dense": X_dense,
+            "meta_df": meta_df,
+            "y_multiclass": y_multiclass,
+        }
+
+    def fit_transform(self, df: pd.DataFrame) -> Dict[str, Any]:
+        return self.fit(df).transform(df)
+
+    def save_artifacts(self, out_dir: str = OUTPUT_DIR):
+        os.makedirs(out_dir, exist_ok=True)
+        joblib.dump(self.tfidf, os.path.join(out_dir, "tfidf_vectorizer.joblib"))
+        joblib.dump(self.scaler, os.path.join(out_dir, "scaler.joblib"))
+        joblib.dump(self.mlb, os.path.join(out_dir, "mlb.joblib"))
+        with open(os.path.join(out_dir, "embed_model.txt"), "w") as f:
+            f.write(self.embed_model_name)
+
+# -----------------------------
+# Main execution
+# -----------------------------
+def main():
+    # Load data
+    df = pd.read_csv(INPUT_CSV)
+    # Preprocess transcripts: create full_light, full_strict, customer_light, customer_strict
+    df = preprocess_dataframe(df, transcript_col_full="transcripts", transcript_col_cust="Customer transcript")
+    # Normalize label column
+    df[COL_MATERIALITY] = df[COL_MATERIALITY].fillna("Neutral").astype(str).str.strip()
+    df[COL_MATERIALITY] = df[COL_MATERIALITY].replace({"NULL": "Neutral", "N/A": "Neutral", "none": "Neutral", "": "Neutral"})
+    df[COL_MATERIALITY] = df[COL_MATERIALITY].str.upper().str.strip()
+    df[COL_MATERIALITY] = df[COL_MATERIALITY].replace({"NULL": "NEUTRAL"})
+    # Ensure only valid classes
+    df = df[df[COL_MATERIALITY].isin(["CONCERN", "COMPLAINT", "NEUTRAL"])]
+    # Stratified split 70/15/15
+    train_val_df, test_df = train_test_split(df, test_size=0.15, random_state=RANDOM_SEED, stratify=df[COL_MATERIALITY])
+    train_df, val_df = train_test_split(train_val_df, test_size=0.17647, random_state=RANDOM_SEED, stratify=train_val_df[COL_MATERIALITY])
+    # Feature engineering
+    fe = FEEngine(tfidf_max_features=TFIDF_MAX_FEAT, tfidf_ngram=TFIDF_NGRAM,
+                  embed_model_name=EMBED_MODEL_NAME, compute_sentiment_auto=False, device=None)
+    fe.fit(train_df)
+    fe.save_artifacts(OUTPUT_DIR)
+    out_train = fe.transform(train_df)
+    out_val   = fe.transform(val_df)
+    out_test  = fe.transform(test_df)
+    X_sparse_train = out_train["X_sparse"]
+    X_sparse_val   = out_val["X_sparse"]
+    X_sparse_test  = out_test["X_sparse"]
+    X_dense_train  = out_train["X_dense"]
+    X_dense_val    = out_val["X_dense"]
+    X_dense_test   = out_test["X_dense"]
+    y_train = out_train["y_multiclass"].astype(int).values
+    y_val   = out_val["y_multiclass"].astype(int).values
+    y_test  = out_test["y_multiclass"].astype(int).values
+    # Train Logistic Regression on sparse features
+    clf_sparse = LogisticRegression(class_weight="balanced", multi_class="multinomial",
+                                    solver="lbfgs", max_iter=1000, random_state=RANDOM_SEED)
+    clf_sparse.fit(X_sparse_train, y_train)
+    # Evaluate sparse model
+    y_pred_sparse = clf_sparse.predict(X_sparse_test)
+    print("Classification report for Sparse Model (TF-IDF + metadata):")
+    print(classification_report(y_test, y_pred_sparse,
+                                labels=[0,1,2], target_names=["Neutral","Concern","Complaint"]))
+    # Train Logistic Regression on dense features
+    clf_dense = LogisticRegression(class_weight="balanced", multi_class="multinomial",
+                                   solver="lbfgs", max_iter=1000, random_state=RANDOM_SEED)
+    clf_dense.fit(X_dense_train, y_train)
+    # Evaluate dense model
+    y_pred_dense = clf_dense.predict(X_dense_test)
+    print("Classification report for Dense Model (Embeddings + metadata):")
+    print(classification_report(y_test, y_pred_dense,
+                                labels=[0,1,2], target_names=["Neutral","Concern","Complaint"]))
+    # Save models
+    joblib.dump(clf_sparse, os.path.join(OUTPUT_DIR, "logreg_sparse.joblib"))
+    joblib.dump(clf_dense, os.path.join(OUTPUT_DIR, "logreg_dense.joblib"))
+    # (Optional) Save engineered data
+    # df_engineered = pd.concat([df.reset_index(drop=True), out_train["meta_df"].reset_index(drop=True)], axis=1)
+    # df_engineered.to_csv(os.path.join(OUTPUT_DIR, "transcripts_engineered.csv"), index=False)
+
+if __name__ == "__main__":
+    main()
