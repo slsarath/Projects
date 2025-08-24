@@ -1,0 +1,84 @@
+Perfect — let’s get concrete. I’ll assume you have your dataset in a Pandas DataFrame called df with a column transcript (full call text) and materiality (Complaint/Concern).
+
+Here’s a full preprocessing pipeline for Step 2:
+
+import pandas as pd
+import re
+import spacy
+
+# Load English model for lemmatization
+nlp = spacy.load("en_core_web_sm", disable=["parser", "ner"])
+
+# Example: df.head()
+# df = pd.DataFrame({
+#     "call_id": [1,2],
+#     "transcript": [
+#         "Agent: Welcome to Barclays\nCustomer: I am calling to raise complaint against the product, which I am not able to use",
+#         "Agent: Good morning\nCustomer: I forgot my PIN and need a new one"
+#     ],
+#     "materiality": ["COMPLAINT", "CONCERN"]
+# })
+
+# ------------------------------------------------------
+# 1. Remove headers like 'Agent:' / 'Customer:'
+def remove_speaker_labels(text):
+    return re.sub(r"\b(Agent|Customer)\s*[:\-]?\s*", "", text, flags=re.IGNORECASE)
+
+# ------------------------------------------------------
+# 2. Normalize text (lowercasing + punctuation removal)
+def normalize_text(text):
+    # Lowercase
+    text = text.lower()
+    # Remove punctuation, numbers, special chars (keep words)
+    text = re.sub(r"[^a-z\s]", " ", text)
+    # Remove extra spaces
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+# ------------------------------------------------------
+# 3. Lemmatization
+def lemmatize_text(text):
+    doc = nlp(text)
+    return " ".join([token.lemma_ for token in doc if not token.is_stop])
+
+# ------------------------------------------------------
+# 4. Extract only customer utterances (optional)
+def extract_customer_only(text):
+    # Keep only lines after 'Customer' labels
+    lines = text.split("\n")
+    customer_lines = [re.sub(r"Customer\s*[:\-]?\s*", "", l, flags=re.IGNORECASE) 
+                      for l in lines if l.strip().lower().startswith("customer")]
+    return " ".join(customer_lines) if customer_lines else text
+
+# ------------------------------------------------------
+# Full preprocessing pipeline
+def preprocess_transcript(text, customer_only=True):
+    if pd.isna(text):
+        return ""
+    if customer_only:
+        text = extract_customer_only(text)
+    text = remove_speaker_labels(text)
+    text = normalize_text(text)
+    text = lemmatize_text(text)
+    return text
+
+# ------------------------------------------------------
+# Apply pipeline
+df["clean_transcript"] = df["transcript"].apply(lambda x: preprocess_transcript(x, customer_only=True))
+
+print(df[["transcript", "clean_transcript", "materiality"]].head(2))
+
+
+⸻
+
+What this does
+	•	Removes speaker tags: “Agent:” / “Customer:”
+	•	Keeps only customer text (optional but useful since dissatisfaction originates there).
+	•	Lowercases + strips punctuation/numbers.
+	•	Lemmatizes words (turns calling → call, complaints → complaint).
+	•	Removes stopwords like “the, is, are”.
+
+⸻
+
+👉 Question for you: Do you want to keep conversational flow (both Agent + Customer) or restrict strictly to customer text for training?
+Because if the model needs context (like agent apologizing), we keep both. If not, we strip down to customer only.
