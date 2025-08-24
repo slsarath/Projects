@@ -1,20 +1,21 @@
-# ============================================
-# Feature Engineering for Call Transcripts
-# ============================================
+# ============================================================
+# Feature Engineering Pipeline for Call Transcripts
+# ============================================================
+import os
 import re
 import gc
+import joblib
 import numpy as np
 import pandas as pd
+from typing import List, Dict, Optional, Tuple
 
-from sklearn.preprocessing import MinMaxScaler, OneHotEncoder, MultiLabelBinarizer
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.utils.validation import check_is_fitted
+from sklearn.preprocessing import MinMaxScaler, MultiLabelBinarizer
+from sklearn.model_selection import train_test_split
 from scipy import sparse as sp
 
-# Sentence embeddings
+import torch
 from sentence_transformers import SentenceTransformer
-
-# HuggingFace sentiment (twitter-roberta)
 from transformers import pipeline
 
 
@@ -22,16 +23,19 @@ from transformers import pipeline
 # Config
 # -----------------------------
 RANDOM_SEED = 42
-PRIMARY_TEXT_COL = "customer_light"   # main column for text features
-FALLBACK_TEXT_COL = "full_light"      # if primary is empty
-NEG_SCORE_COL = "Max negative customer score"
-COST_COL = "Total cost"               # optional; included if present
-MATERIALITY_COL = "Materiality"       # expected: "COMPLAINT", "CONCERN", or null
+np.random.seed(RANDOM_SEED)
 
-# Treat 'sep' as a turn delimiter (since [SEP] became sep in your pipeline)
-TURN_TOKEN = r"\bsep\b"
+# Column name candidates for robustness
+COL_TEXT_PRIMARY = "customer_light"
+COL_TEXT_FALLBACK = "full_light"
+COL_MATERIALITY = "Materiality"
+COL_NEG_MAX_CANDIDATES = ["Max negative customer score", "Max Negative Sentiment Score"]
+COL_COST_CANDIDATES = ["Total cost", "Total Cost", "TotalCost"]
 
-# Keyword map (tweak as needed)
+# Turn delimiter (since [SEP] became 'sep' after your preprocessing)
+TURN_TOKEN_REGEX = r"\bsep\b"
+
+# Keyword map (adjust as needed)
 CATEGORY_KEYWORDS = {
     "Refund": ["refund", "money back", "reimbursement", "return my money"],
     "Disconnection": ["disconnect", "cut off", "call drop", "line cut"],
@@ -50,65 +54,42 @@ CATEGORY_KEYWORDS = {
     "Positive Mention": ["happy", "good service", "satisfied", "thank you"],
 }
 
+
 # -----------------------------
-# Utilities
+# Helpers
 # -----------------------------
+def pick_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
 def choose_text_series(df: pd.DataFrame) -> pd.Series:
-    """Prefer PRIMARY_TEXT_COL; if empty/missing fallback to FALLBACK_TEXT_COL."""
-    if PRIMARY_TEXT_COL in df.columns:
-        s = df[PRIMARY_TEXT_COL].fillna("").astype(str)
+    if COL_TEXT_PRIMARY in df.columns and df[COL_TEXT_PRIMARY].notna().any():
+        s = df[COL_TEXT_PRIMARY].fillna("").astype(str)
         if s.str.strip().str.len().sum() > 0:
             return s
-    if FALLBACK_TEXT_COL in df.columns:
-        return df[FALLBACK_TEXT_COL].fillna("").astype(str)
-    raise KeyError(f"Neither '{PRIMARY_TEXT_COL}' nor '{FALLBACK_TEXT_COL}' present.")
+    if COL_TEXT_FALLBACK in df.columns:
+        return df[COL_TEXT_FALLBACK].fillna("").astype(str)
+    raise KeyError(f"Neither '{COL_TEXT_PRIMARY}' nor '{COL_TEXT_FALLBACK}' present in dataframe.")
 
-def chunk_text(text: str, max_chars: int = 1000):
+def chunk_text(text: str, max_chars: int = 1000) -> List[str]:
     if not isinstance(text, str) or not text:
         return []
-    return [text[i:i+max_chars] for i in range(0, len(text), max_chars)]
-
-def encode_with_chunks(model, text: str):
-    """Mean-pool embeddings over chunks."""
-    if not isinstance(text, str) or text.strip() == "":
-        return np.zeros(model.get_sentence_embedding_dimension(), dtype=np.float32)
-    chunks = chunk_text(text, max_chars=1000)
-    vecs = model.encode(chunks, convert_to_tensor=True, truncate=True)
-    return vecs.mean(dim=0).cpu().numpy()
-
-def aggregate_sentiment(pipe, text: str):
-    """Run twitter-roberta on chunks and average label scores."""
-    if not isinstance(text, str) or text.strip() == "":
-        return {"roberta_label": None, "roberta_score": np.nan,
-                "roberta_neg": np.nan, "roberta_neu": np.nan, "roberta_pos": np.nan}
-    chunks = chunk_text(text, max_chars=512)
-    buckets = {"NEGATIVE": [], "NEUTRAL": [], "POSITIVE": []}
-    for ch in chunks:
-        try:
-            out = pipe(ch[:512])[0]
-            buckets[out["label"].upper()].append(out["score"])
-        except Exception:
-            continue
-    if not any(len(v) for v in buckets.values()):
-        return {"roberta_label": None, "roberta_score": np.nan,
-                "roberta_neg": np.nan, "roberta_neu": np.nan, "roberta_pos": np.nan}
-    avg = {k: float(np.mean(v)) if v else 0.0 for k, v in buckets.items()}
-    best_label = max(avg, key=avg.get)
-    return {"roberta_label": best_label, "roberta_score": avg[best_label],
-            "roberta_neg": avg["NEGATIVE"], "roberta_neu": avg["NEUTRAL"], "roberta_pos": avg["POSITIVE"]}
+    return [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
 
 def count_occurrences(pattern: str, text: str) -> int:
-    if not isinstance(text, str):
+    if not isinstance(text, str) or not text:
         return 0
     return len(re.findall(pattern, text))
 
 def count_money_mentions(text: str) -> int:
-    if not isinstance(text, str):
+    if not isinstance(text, str) or not text:
         return 0
-    # robust: [MONEY], [money], or bare token "money"
+    # Handle [MONEY], [money], and bare 'money'
     return len(re.findall(r"\[?money\]?", text, flags=re.IGNORECASE))
 
-def tag_transcript_keywords(text: str) -> list:
+def tag_transcript_keywords(text: str) -> List[str]:
     if not isinstance(text, str) or not text:
         return []
     txt = text.lower()
@@ -118,244 +99,406 @@ def tag_transcript_keywords(text: str) -> list:
             tags.append(cat)
     return tags
 
-def structural_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Create simple, cheap structure/lexical features from cleaned columns."""
-    cust = df.get("customer_light", pd.Series([""] * len(df)))
-    full_ = df.get("full_light", pd.Series([""] * len(df)))
-
-    f = pd.DataFrame(index=df.index)
-    # token counts
-    f["cust_tokens"] = cust.fillna("").str.split().apply(len)
-    f["full_tokens"] = full_.fillna("").str.split().apply(len)
-    f["type_token_ratio"] = (cust.fillna("").str.split().apply(lambda x: len(set(x)) / (len(x) + 1e-6)))
-    # turns via 'sep'
-    f["cust_turns"] = cust.fillna("").apply(lambda x: count_occurrences(TURN_TOKEN, x) + 1 if x.strip() else 0)
-    f["full_turns"] = full_.fillna("").apply(lambda x: count_occurrences(TURN_TOKEN, x) + 1 if x.strip() else 0)
-    # avg turn length (tokens)
-    f["cust_avg_turn_len"] = f.apply(lambda r: r["cust_tokens"] / max(r["cust_turns"], 1), axis=1)
-    f["full_avg_turn_len"] = f.apply(lambda r: r["full_tokens"] / max(r["full_turns"], 1), axis=1)
-    # punctuation proxies (on full_light which keeps ?, !)
-    f["qmarks"] = full_.fillna("").str.count(r"\?")
-    f["exclaims"] = full_.fillna("").str.count(r"\!")
-    # money mentions
-    f["money_mentions"] = cust.fillna("").apply(count_money_mentions)
-    # basic lexicon flags
-    f["kw_complaint_hits"] = cust.fillna("").str.count(r"\bcomplain\w*|\bdissatisf\w*|\bissue\b")
-    f["kw_concern_hits"] = cust.fillna("").str.count(r"\bconcern\w*|\bworr\w*|\bnot happy\b")
-    f["kw_fraud_hits"] = cust.fillna("").str.count(r"\bfraud\w*|\bunauthori\w*|\bscam\w*|\bhack\w*")
-    return f
-
-def build_targets(df: pd.DataFrame):
-    """Returns y_binary (Complaint vs Concern) and y_multiclass (Neutral/Concern/Complaint)."""
-    mat = df.get(MATERIALITY_COL)
-    if mat is None:
-        raise KeyError(f"'{MATERIALITY_COL}' column not found.")
-    mat = mat.fillna("NEUTRAL").str.upper().str.strip()
-    # 3-class
-    map3 = {"NEUTRAL": 0, "CONCERN": 1, "COMPLAINT": 2}
-    y_multiclass = mat.map(map3).astype("Int64")
-    # Binary (drop NEUTRAL)
-    mask_bc = mat.isin(["COMPLAINT", "CONCERN"])
-    y_binary = mat[mask_bc].map({"CONCERN": 0, "COMPLAINT": 1}).astype("Int64")
-    return y_binary, mask_bc, y_multiclass
 
 # -----------------------------
-# Main FE function
+# Feature Engineer
 # -----------------------------
-def engineer_features(df_clean: pd.DataFrame,
-                      compute_roberta: bool = True,
-                      compute_tfidf: bool = True,
-                      compute_embeddings: bool = True,
-                      tfidf_max_features: int = 20000,
-                      tfidf_ngram: tuple = (1, 2),
-                      device: str = None):
+class FeatureEngineer:
     """
-    Returns:
-      features = {
-        'X_sparse': <csr_matrix>  (TF-IDF + meta),
-        'X_dense':  <ndarray>     (MPNet + meta),
-        'meta_df':  <DataFrame>   (numeric + encoded),
-        'tfidf':    <Vectorizer or None>,
-        'emb_model':<SentenceTransformer or None>,
-        'ohe_categories': <list>,
-        'mlb_classes': <list>,
-        'y_binary': <Series>,
-        'mask_binary': <Series[bool]>,
-        'y_multiclass': <Series>
-      }
+    Produces:
+      - X_sparse: csr_matrix  (TF-IDF + meta features)
+      - X_dense:  np.ndarray  (MPNet embeddings + meta features)
+      - meta_df:  DataFrame   (numeric + structural + keyword multi-hot [+ sentiment probs])
+      - artifacts: fitted objects (tfidf, scaler, mlb, emb_model_name, etc.)
+      - targets: y_binary (Complaint=1 vs Concern=0), mask_binary (to subset), y_multiclass (0=Neutral,1=Concern,2=Complaint)
     """
-    df = df_clean.copy()
 
-    # Choose text column
-    text_series = choose_text_series(df)
+    def __init__(
+        self,
+        tfidf_max_features: int = 20000,
+        tfidf_ngram: Tuple[int, int] = (1, 2),
+        compute_sentiment: str = "auto",  # "auto", "always", "never"
+        device: Optional[str] = None,     # "cuda" to force GPU
+    ):
+        self.tfidf_max_features = tfidf_max_features
+        self.tfidf_ngram = tfidf_ngram
+        self.compute_sentiment = compute_sentiment
+        self.device = device if device else ("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ---------------------------
-    # 0) Keyword tags (multi-hot)
-    # ---------------------------
-    if "keyword_tags" not in df.columns:
-        df["keyword_tags"] = text_series.apply(tag_transcript_keywords)
-    mlb = MultiLabelBinarizer()
-    tags_mlb = mlb.fit_transform(df["keyword_tags"].apply(lambda x: x if isinstance(x, list) else []))
-    tags_df = pd.DataFrame(tags_mlb, index=df.index, columns=[f"tag_{c}" for c in mlb.classes_])
+        # Artifacts
+        self.tfidf: Optional[TfidfVectorizer] = None
+        self.scaler: Optional[MinMaxScaler] = None
+        self.mlb: Optional[MultiLabelBinarizer] = None
+        self.emb_model: Optional[SentenceTransformer] = None
+        self.emb_model_name: str = "sentence-transformers/all-mpnet-base-v2"
 
-    # ---------------------------
-    # 1) Sentiment (twitter-roberta)
-    # ---------------------------
-    if compute_roberta:
-        sentiment_pipe = pipeline(
+        # Fitted flags
+        self._fitted = False
+
+    # ---------- core blocks ----------
+    def _structural_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        cust = df.get(COL_TEXT_PRIMARY, pd.Series([""] * len(df))).fillna("")
+        full_ = df.get(COL_TEXT_FALLBACK, pd.Series([""] * len(df))).fillna("")
+
+        f = pd.DataFrame(index=df.index)
+        # token counts
+        f["cust_tokens"] = cust.str.split().apply(len)
+        f["full_tokens"] = full_.str.split().apply(len)
+        f["type_token_ratio"] = cust.str.split().apply(lambda x: len(set(x)) / (len(x) + 1e-6))
+        # turns via 'sep'
+        f["cust_turns"] = cust.apply(lambda x: count_occurrences(TURN_TOKEN_REGEX, x) + 1 if x.strip() else 0)
+        f["full_turns"] = full_.apply(lambda x: count_occurrences(TURN_TOKEN_REGEX, x) + 1 if x.strip() else 0)
+        # avg turn len
+        f["cust_avg_turn_len"] = f.apply(lambda r: r["cust_tokens"] / max(r["cust_turns"], 1), axis=1)
+        f["full_avg_turn_len"] = f.apply(lambda r: r["full_tokens"] / max(r["full_turns"], 1), axis=1)
+        # punctuation proxies
+        f["qmarks"] = full_.str.count(r"\?")
+        f["exclaims"] = full_.str.count(r"\!")
+        # money mentions
+        f["money_mentions"] = cust.apply(count_money_mentions)
+        # lexical flags
+        f["kw_complaint_hits"] = cust.str.count(r"\bcomplain\w*|\bdissatisf\w*|\bissue\b")
+        f["kw_concern_hits"] = cust.str.count(r"\bconcern\w*|\bworr\w*|\bnot happy\b")
+        f["kw_fraud_hits"] = cust.str.count(r"\bfraud\w*|\bunauthori\w*|\bscam\w*|\bhack\w*")
+        return f.fillna(0.0)
+
+    def _numeric_block(self, df: pd.DataFrame) -> pd.DataFrame:
+        cols = []
+        # Max negative score (support both spellings)
+        neg_col = pick_column(df, COL_NEG_MAX_CANDIDATES)
+        if neg_col:
+            cols.append(neg_col)
+        # Total cost
+        cost_col = pick_column(df, COL_COST_CANDIDATES)
+        if cost_col:
+            # clean to numeric
+            df[cost_col] = pd.to_numeric(df[cost_col].astype(str).str.replace(r"[^\d.]", "", regex=True), errors="coerce")
+            cols.append(cost_col)
+
+        num = pd.DataFrame(index=df.index)
+        for c in cols:
+            num[c] = pd.to_numeric(df[c], errors="coerce")
+
+        return num.fillna(0.0)
+
+    def _sentiment_probs(self, texts: pd.Series) -> pd.DataFrame:
+        """twitter-roberta-base-sentiment probabilities (NEG/NEU/POS)."""
+        pipe = pipeline(
             "sentiment-analysis",
             model="cardiffnlp/twitter-roberta-base-sentiment",
             truncation=True,
-            device=0 if device == "cuda" else -1
+            device=0 if self.device == "cuda" else -1
         )
-        sent_rows = [aggregate_sentiment(sentiment_pipe, t) for t in text_series.tolist()]
-        sent_df = pd.DataFrame(sent_rows, index=df.index)
-        df = pd.concat([df, sent_df], axis=1)
-    else:
-        # ensure columns exist
-        for col in ["roberta_label", "roberta_score", "roberta_neg", "roberta_neu", "roberta_pos"]:
-            if col not in df.columns:
-                df[col] = np.nan
+        rows = []
+        for t in texts.tolist():
+            if not isinstance(t, str) or not t.strip():
+                rows.append({"roberta_neg": 0.0, "roberta_neu": 0.0, "roberta_pos": 0.0})
+                continue
+            chunks = chunk_text(t, max_chars=512)
+            acc = {"NEGATIVE": [], "NEUTRAL": [], "POSITIVE": []}
+            for ch in chunks:
+                try:
+                    out = pipe(ch[:512])[0]
+                    acc[out["label"].upper()].append(out["score"])
+                except Exception:
+                    continue
+            if not any(len(v) for v in acc.values()):
+                rows.append({"roberta_neg": 0.0, "roberta_neu": 0.0, "roberta_pos": 0.0})
+            else:
+                rows.append({
+                    "roberta_neg": float(np.mean(acc["NEGATIVE"])) if acc["NEGATIVE"] else 0.0,
+                    "roberta_neu": float(np.mean(acc["NEUTRAL"])) if acc["NEUTRAL"] else 0.0,
+                    "roberta_pos": float(np.mean(acc["POSITIVE"])) if acc["POSITIVE"] else 0.0,
+                })
+        return pd.DataFrame(rows, index=texts.index)
 
-    # one-hot roberta_label
-    ohe = OneHotEncoder(sparse=False, handle_unknown="ignore")
-    lbl = df[["roberta_label"]].fillna("NEUTRAL")
-    lbl_ohe = ohe.fit_transform(lbl)
-    sentiment_ohe_df = pd.DataFrame(lbl_ohe, index=df.index,
-                                    columns=[f"sent_{c}" for c in ohe.categories_[0]])
-
-    # ---------------------------
-    # 2) Structural & numeric features
-    # ---------------------------
-    struct_df = structural_features(df)
-
-    # numeric: negative score (+ cost if present)
-    numeric_cols = []
-    if NEG_SCORE_COL in df.columns:
-        numeric_cols.append(NEG_SCORE_COL)
-    if COST_COL in df.columns:
-        # Coerce numerics safely
-        df[COST_COL] = pd.to_numeric(
-            df[COST_COL].astype(str).str.replace(r"[^\d.]", "", regex=True),
-            errors="coerce"
-        )
-        numeric_cols.append(COST_COL)
-
-    numeric_df = df[numeric_cols].copy() if numeric_cols else pd.DataFrame(index=df.index)
-    # add roberta scalar scores
-    for col in ["roberta_score", "roberta_neg", "roberta_neu", "roberta_pos"]:
-        if col in df.columns:
-            numeric_df[col] = df[col]
-
-    # scale numerics
-    if numeric_df.shape[1] > 0:
-        scaler = MinMaxScaler()
-        numeric_df[:] = scaler.fit_transform(numeric_df.fillna(0.0))
-    else:
-        scaler = None
-
-    # ---------------------------
-    # 3) Meta feature block
-    # ---------------------------
-    meta_df = pd.concat([numeric_df, sentiment_ohe_df, tags_df, struct_df], axis=1).fillna(0.0)
-
-    # ---------------------------
-    # 4) TF-IDF (sparse)
-    # ---------------------------
-    if compute_tfidf:
-        tfidf = TfidfVectorizer(
-            max_features=tfidf_max_features,
-            ngram_range=tfidf_ngram,
+    def _tfidf_fit(self, texts: pd.Series):
+        self.tfidf = TfidfVectorizer(
+            max_features=self.tfidf_max_features,
+            ngram_range=self.tfidf_ngram,
             token_pattern=r"(?u)\b\w+\b"  # keep 'sep' as a token
         )
-        X_tfidf = tfidf.fit_transform(text_series.fillna(""))
+        return self.tfidf.fit_transform(texts.fillna(""))
+
+    def _tfidf_transform(self, texts: pd.Series):
+        if self.tfidf is None:
+            raise RuntimeError("TF-IDF vectorizer is not fitted.")
+        return self.tfidf.transform(texts.fillna(""))
+
+    def _embed_model(self):
+        if self.emb_model is None:
+            self.emb_model = SentenceTransformer(self.emb_model_name, device=self.device)
+        return self.emb_model
+
+    def _encode_with_chunks(self, model: SentenceTransformer, text: str) -> np.ndarray:
+        if not isinstance(text, str) or text.strip() == "":
+            return np.zeros(model.get_sentence_embedding_dimension(), dtype=np.float32)
+        chunks = chunk_text(text, max_chars=1000)
+        vecs = model.encode(chunks, convert_to_tensor=True, truncate=True)
+        return vecs.mean(dim=0).cpu().numpy()
+
+    def _encode_series(self, texts: pd.Series, batch_size: int = 64) -> np.ndarray:
+        model = self._embed_model()
+        # Encode in chunks to manage memory for large datasets
+        embs = []
+        buf = []
+        idx_map = []
+        for i, t in enumerate(texts.tolist()):
+            buf.append(t)
+            idx_map.append(i)
+            if len(buf) == batch_size:
+                # encode each with mean pooling over chunks
+                batch_vecs = [self._encode_with_chunks(model, x) for x in buf]
+                embs.append(np.vstack(batch_vecs))
+                buf, idx_map = [], []
+        if buf:
+            batch_vecs = [self._encode_with_chunks(model, x) for x in buf]
+            embs.append(np.vstack(batch_vecs))
+        return np.vstack(embs).astype(np.float32) if embs else np.zeros((len(texts), model.get_sentence_embedding_dimension()), dtype=np.float32)
+
+    def _build_meta(self, df: pd.DataFrame, text_series: pd.Series, add_sentiment: bool) -> Tuple[pd.DataFrame, Dict]:
+        # keyword multi-hot
+        if self.mlb is None:
+            self.mlb = MultiLabelBinarizer()
+            tags_m = self.mlb.fit_transform(text_series.apply(tag_transcript_keywords))
+        else:
+            tags_m = self.mlb.transform(text_series.apply(tag_transcript_keywords))
+        tags_df = pd.DataFrame(tags_m, index=df.index, columns=[f"tag_{c}" for c in self.mlb.classes_])
+
+        # structural
+        struct_df = self._structural_features(df)
+
+        # numeric (Max negative customer score, Total cost)
+        num_df = self._numeric_block(df)
+
+        # sentiment (optional)
+        if add_sentiment:
+            sent_df = self._sentiment_probs(text_series)
+        else:
+            sent_df = pd.DataFrame({"roberta_neg": 0.0, "roberta_neu": 0.0, "roberta_pos": 0.0}, index=df.index)
+
+        # scale numerics + sentiment scalars together
+        scale_block = pd.concat([num_df, sent_df], axis=1)
+        if self.scaler is None:
+            self.scaler = MinMaxScaler()
+            scale_vals = pd.DataFrame(self.scaler.fit_transform(scale_block.fillna(0.0)),
+                                      index=df.index, columns=scale_block.columns)
+        else:
+            scale_vals = pd.DataFrame(self.scaler.transform(scale_block.fillna(0.0)),
+                                      index=df.index, columns=scale_block.columns)
+
+        meta_df = pd.concat([scale_vals, struct_df, tags_df], axis=1).fillna(0.0)
+        return meta_df, {"scaled_cols": list(scale_vals.columns)}
+
+    def _should_add_sentiment(self, df: pd.DataFrame) -> bool:
+        if self.compute_sentiment == "always":
+            return True
+        if self.compute_sentiment == "never":
+            return False
+        # auto: enable only when neutral/query cases exist
+        if COL_MATERIALITY in df.columns:
+            mat = df[COL_MATERIALITY].astype(str).str.upper().str.strip()
+            has_neutral = mat.isna().any() or (mat == "NEUTRAL").any() or (mat == "" ).any()
+            return bool(has_neutral)
+        # No label column → safe to include
+        return True
+
+    def _build_targets(self, df: pd.DataFrame):
+        if COL_MATERIALITY not in df.columns:
+            # No labels, return placeholders
+            n = len(df)
+            return (pd.Series([pd.NA] * n, dtype="Int64"),
+                    pd.Series([False] * n),
+                    pd.Series([pd.NA] * n, dtype="Int64"))
+        mat = df[COL_MATERIALITY].fillna("NEUTRAL").astype(str).str.upper().str.strip()
+        map3 = {"NEUTRAL": 0, "CONCERN": 1, "COMPLAINT": 2}
+        y_multiclass = mat.map(map3).astype("Int64")
+        mask_bc = mat.isin(["COMPLAINT", "CONCERN"])
+        y_binary = mat[mask_bc].map({"CONCERN": 0, "COMPLAINT": 1}).astype("Int64")
+        return y_binary, mask_bc, y_multiclass
+
+    # ---------- public API ----------
+    def fit(self, df: pd.DataFrame):
+        df = df.copy()
+        text_series = choose_text_series(df)
+
+        # Fit TF-IDF
+        _ = self._tfidf_fit(text_series)
+
+        # Fit meta blocks (scaler + mlb + (optionally) sentiment)
+        add_sentiment = self._should_add_sentiment(df)
+        _meta_df, _info = self._build_meta(df, text_series, add_sentiment)
+
+        # Warm up embedding model (lazy loaded on transform anyway)
+        self._embed_model()
+
+        self._fitted = True
+        return self
+
+    def transform(self, df: pd.DataFrame):
+        if not self._fitted:
+            raise RuntimeError("Call fit() before transform().")
+
+        df = df.copy()
+        text_series = choose_text_series(df)
+
+        # TF-IDF
+        X_tfidf = self._tfidf_transform(text_series)
+
+        # Meta
+        add_sentiment = self._should_add_sentiment(df)
+        meta_df, meta_info = self._build_meta(df, text_series, add_sentiment)
+
+        # Sparse matrix (TF-IDF + meta)
         X_sparse = sp.hstack([X_tfidf, sp.csr_matrix(meta_df.values)], format="csr")
-    else:
-        tfidf, X_sparse = None, None
 
-    # ---------------------------
-    # 5) MPNet embeddings (dense)
-    # ---------------------------
-    if compute_embeddings:
-        emb_model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2", device=device or "cpu")
-        emb_dim = emb_model.get_sentence_embedding_dimension()
-        embs = np.vstack([encode_with_chunks(emb_model, t) for t in text_series.tolist()]).astype(np.float32)
+        # Embeddings (MPNet) + meta
+        embs = self._encode_series(text_series)
         X_dense = np.hstack([embs, meta_df.values.astype(np.float32)])
-    else:
-        emb_model, X_dense = None, None
 
-    # ---------------------------
-    # 6) Targets
-    # ---------------------------
-    y_binary, mask_binary, y_multiclass = build_targets(df)
+        # Targets
+        y_binary, mask_binary, y_multiclass = self._build_targets(df)
 
-    # Housekeeping
-    gc.collect()
+        artifacts = {
+            "tfidf": self.tfidf,
+            "scaler": self.scaler,
+            "mlb": self.mlb,
+            "emb_model_name": self.emb_model_name,
+            "meta_scaled_cols": meta_info["scaled_cols"],
+            "dense_dim": embs.shape[1],
+            "meta_dim": meta_df.shape[1],
+            "sparse_dim": X_sparse.shape[1],
+        }
 
-    return {
-        "X_sparse": X_sparse,
-        "X_dense": X_dense,
-        "meta_df": meta_df,
-        "tfidf": tfidf,
-        "emb_model": emb_model,
-        "ohe_categories": list(ohe.categories_[0]),
-        "mlb_classes": list(mlb.classes_),
-        "y_binary": y_binary,            # Complaint(1) vs Concern(0) (neutral dropped via mask)
-        "mask_binary": mask_binary,      # use this mask to subset X_* and y_binary
-        "y_multiclass": y_multiclass,    # 0=Neutral, 1=Concern, 2=Complaint
-    }
+        gc.collect()
+        return {
+            "X_sparse": X_sparse,
+            "X_dense": X_dense,
+            "meta_df": meta_df,
+            "artifacts": artifacts,
+            "y_binary": y_binary,
+            "mask_binary": mask_binary,
+            "y_multiclass": y_multiclass,
+        }
+
+    def fit_transform(self, df: pd.DataFrame):
+        return self.fit(df).transform(df)
+
+    # ---------- persistence ----------
+    def save_artifacts(self, path: str):
+        os.makedirs(path, exist_ok=True)
+        joblib.dump(self.tfidf, os.path.join(path, "tfidf.joblib"))
+        joblib.dump(self.scaler, os.path.join(path, "scaler.joblib"))
+        joblib.dump(self.mlb, os.path.join(path, "mlb.joblib"))
+        # embedding model is referenced by name; no need to dump weights
+        with open(os.path.join(path, "embedding_model.txt"), "w") as f:
+            f.write(self.emb_model_name)
+
+    @staticmethod
+    def save_matrices(X_sparse, X_dense, meta_df, path: str, prefix: str = "fe"):
+        os.makedirs(path, exist_ok=True)
+        sp.save_npz(os.path.join(path, f"{prefix}_Xsparse.npz"), X_sparse)
+        np.save(os.path.join(path, f"{prefix}_Xdense.npy"), X_dense)
+        meta_df.to_csv(os.path.join(path, f"{prefix}_meta.csv"), index=False)
 
 
-# =========================================================
+# -----------------------------
 # Example usage
-# =========================================================
+# -----------------------------
 if __name__ == "__main__":
-    # Load your already preprocessed dataframe (with full_light / customer_light / etc.)
-    df_clean = pd.read_csv("transcripts_clean.csv")  # <- replace with your path
+    # Expect a CSV already preprocessed to have:
+    # full_light, full_strict, customer_light, customer_strict, Materiality,
+    # Max negative customer score (or Max Negative Sentiment Score), optional Total cost
+    df_clean = pd.read_csv("transcripts_clean.csv")
 
-    feats = engineer_features(
-        df_clean,
-        compute_roberta=True,          # uses twitter-roberta-base-sentiment
-        compute_tfidf=True,
-        compute_embeddings=True,       # uses all-mpnet-base-v2
+    fe = FeatureEngineer(
         tfidf_max_features=20000,
         tfidf_ngram=(1, 2),
-        device=None                    # "cuda" if you have GPU; else None/CPU
+        compute_sentiment="auto",  # auto-add sentiment only if neutral/query cases exist
+        device=None                # set "cuda" to force GPU; defaults to auto-detect
     )
 
-    # Sparse (TF-IDF + meta)
-    Xs = feats["X_sparse"]
-    # Dense (MPNet + meta)
-    Xd = feats["X_dense"]
+    out = fe.fit_transform(df_clean)
 
-    # Targets
-    y_bin = feats["y_binary"]
-    m_bin = feats["mask_binary"]
-    y_3c = feats["y_multiclass"]
+    Xs = out["X_sparse"]      # TF-IDF + meta (sparse)
+    Xd = out["X_dense"]       # MPNet + meta (dense)
+    meta = out["meta_df"]
+    y_bin = out["y_binary"]           # Complaint(1) vs Concern(0); mask to drop neutral
+    mask_bin = out["mask_binary"]     # keep rows where materiality is Complaint/Concern
+    y_3c = out["y_multiclass"]        # 0=Neutral, 1=Concern, 2=Complaint
 
-    print("Sparse shape:", None if Xs is None else Xs.shape)
-    print("Dense shape:", None if Xd is None else Xd.shape)
-    print("Meta cols:", feats["meta_df"].shape[1])
-    print("OHE sentiment cats:", feats["ohe_categories"])
-    print("Keyword tags:", feats["mlb_classes"])
+    print("Sparse shape:", Xs.shape)
+    print("Dense shape:", Xd.shape)
+    print("Meta cols:", meta.shape[1])
+    print("Binary labeled rows:", int(mask_bin.sum()))
+    print("Multiclass label counts:\n", y_3c.value_counts(dropna=False).sort_index())
 
-    # Example: train binary classifier on Complaint vs Concern using dense features
-    # Only keep rows where binary labels exist (drop NEUTRAL)
-    if Xd is not None:
-        Xd_bin = Xd[m_bin.values]
-        y_bin2 = y_bin.dropna().values.astype(int)
+    # Persist (optional)
+    fe.save_artifacts(path="artifacts")
+    FeatureEngineer.save_matrices(Xs, Xd, meta, path="artifacts", prefix="v1")
 
-        from sklearn.model_selection import train_test_split
+    # Example: train a quick Complaint vs Concern model on dense features
+    # (only where labels exist; drop neutral)
+    try:
         from xgboost import XGBClassifier
         from sklearn.metrics import classification_report
 
+        Xd_bin = Xd[mask_bin.values]
+        yb = y_bin.dropna().astype(int).values
+
         Xtr, Xte, ytr, yte = train_test_split(
-            Xd_bin, y_bin2, test_size=0.2, random_state=RANDOM_SEED, stratify=y_bin2
+            Xd_bin, yb, test_size=0.2, random_state=RANDOM_SEED, stratify=yb
         )
+
         clf = XGBClassifier(
-            n_estimators=400, max_depth=6, learning_rate=0.05, subsample=0.9, colsample_bytree=0.9,
-            reg_lambda=1.0, eval_metric="logloss", random_state=RANDOM_SEED, n_jobs=-1
+            n_estimators=400, max_depth=6, learning_rate=0.05,
+            subsample=0.9, colsample_bytree=0.9, reg_lambda=1.0,
+            eval_metric="logloss", random_state=RANDOM_SEED, n_jobs=-1
         )
         clf.fit(Xtr, ytr)
         pred = clf.predict(Xte)
-        print(classification_report(yte, pred, target_names=["CONCERN","COMPLAINT"]))
+        print(classification_report(yte, pred, target_names=["CONCERN", "COMPLAINT"]))
+    except Exception as e:
+        print("Classifier demo skipped:", e)
+
+
+# ---------------------------------------------------
+# 7. Save engineered dataset
+# ---------------------------------------------------
+# Save full dataframe with engineered columns
+df.to_csv("transcripts_engineered.csv", index=False)
+
+# Optionally save the feature matrix (dense)
+import numpy as np
+np.save("X_features.npy", X_features)
+
+# ---------------------------------------------------
+# 8. Train/test split + save model
+# ---------------------------------------------------
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+import joblib
+
+# Example training (replace with your classifier of choice)
+X_train, X_test, y_train, y_test = train_test_split(
+    X_features, y, test_size=0.2, random_state=42, stratify=y
+)
+
+clf = LogisticRegression(max_iter=2000, class_weight="balanced")
+clf.fit(X_train, y_train)
+
+# Save model
+joblib.dump(clf, "complaint_concern_model.pkl")
+
+# Save TF-IDF vectorizer & scaler (needed for inference)
+joblib.dump(tfidf, "tfidf_vectorizer.pkl")
+joblib.dump(scaler, "numeric_scaler.pkl")
+
+# ---------------------------------------------------
+# 9. Save embeddings separately (optional but faster later)
+# ---------------------------------------------------
+np.save("sentence_embeddings.npy", X_embed)   # X_embed is from SentenceTransformer
+
+# To reload later without re-encoding:
+# X_embed = np.load("sentence_embeddings.npy")
+
