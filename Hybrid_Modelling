@@ -3,24 +3,27 @@
 """
 Hybrid 3-class classifier (Complaint, Concern, Neutral) for call transcripts.
 
-What it does
-------------
-1) Builds semantic keyword clusters (data-driven) from your corpus using TF-IDF
-   candidates expanded by sentence-embedding similarity to seed phrases.
-2) Computes chunked sentence-transformer embeddings for each transcript.
-3) Creates rule features you specified (loudness, AWS sentiment -5..+5, keyword/similarity).
-4) Trains a multinomial Logistic Regression on fused features (embeddings + rules + counts).
-5) At inference, blends ML probabilities with rule signals for a combined decision.
+Pipeline
+--------
+1) (Optional) Lightweight text preprocessing helpers included for reuse.
+2) Build data-driven keyword clusters from TRAIN split using TF-IDF n-grams,
+   expanded via sentence embedding similarity to seed phrases.
+3) Compute pooled sentence embeddings for each transcript (chunked).
+4) Create rule features (loudness, AWS sentiment -5..+5, keyword hits, semantic sims).
+5) Train multinomial Logistic Regression on fused features (embeddings + numeric + rules).
+6) Blend ML probabilities with rule one-hots for the final "hybrid" decision.
+7) Save artifacts; provide inference() for batch scoring.
 
-Outputs
--------
-- Models and artifacts under OUTPUT_DIR
-- terminal: classification reports for val/test
+Notes
+-----
+- Expects materiality labels in {NEUTRAL, CONCERN, COMPLAINT}. Script normalizes
+  plural variants ("CONCERNS", "COMPLAINTS") and common null-like values.
+- Uses only customer_light/full_light text. Adjust column names below if needed.
 """
 
-# ---------------------------
-# Config
-# ---------------------------
+# =========================
+# Imports & Config
+# =========================
 import os
 import re
 import json
@@ -29,63 +32,61 @@ import gc
 import joblib
 import numpy as np
 import pandas as pd
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
 from sklearn.model_selection import train_test_split
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report
-from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
-from scipy.sparse import csr_matrix, hstack
-from numpy.linalg import norm
 
 from sentence_transformers import SentenceTransformer
+from numpy.linalg import norm
 
-# ====== PATHS / COLUMNS ======
-INPUT_CSV   = "input_transcripts.csv"  # ### CHANGE HERE
-OUTPUT_DIR  = "artifacts_hybrid_v1"    # ### CHANGE HERE
+# ----- Paths & Columns -----
+INPUT_CSV   = "input_transcripts.csv"         # ### CHANGE HERE
+OUTPUT_DIR  = "artifacts_hybrid_v1"           # ### CHANGE HERE
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-COL_TEXT_CUST   = "customer_light"     # ### CHANGE HERE if your text lives elsewhere
-COL_TEXT_FULL   = "full_light"         # optional fallback
-COL_LABEL       = "materiality"        # values expected: NEUTRAL / CONCERN / COMPLAINT
-COL_LOUDNESS    = "loudnessscore"      # numeric %
-COL_SENTIMENT   = "Max negative customer score"  # AWS Contact Lens (-5..+5)
+COL_TEXT_CUST   = "customer_light"            # ### CHANGE HERE if your text lives elsewhere
+COL_TEXT_FULL   = "full_light"                # optional fallback
+COL_LABEL       = "materiality"               # values: NEUTRAL / CONCERN / COMPLAINT (script normalizes)
+COL_LOUDNESS    = "loudnessscore"             # numeric (e.g., 0..100 or %)
+COL_SENTIMENT   = "Max negative customer score"  # AWS Contact Lens sentiment (-5..+5)
 
+# ----- Random seed / model -----
 RANDOM_SEED     = 42
 EMBED_MODEL     = "sentence-transformers/all-mpnet-base-v2"  # ### CHANGE HERE if you prefer another
 MAX_CHARS_CHUNK = 1000
 
-# Rule thresholds (tune as you like)
-LOUD_HIGH_TH     = 96.0
-SENT_STRONG_NEG  = -3.0
-SENT_MOD_NEG_MAX = 0.0
-NEU_POS_TH       = 0.5
+# ----- Rule thresholds (tune) -----
+LOUD_HIGH_TH     = 96.0      # loudness above this is "high"
+SENT_STRONG_NEG  = -3.0      # <= strong negative -> complaint-ish
+SENT_MOD_NEG_MAX = 0.0       # (-3, 0] -> concern-ish
+NEU_POS_TH       = 0.5       # >= positive-ish sentiment -> neutral-ish
 
-# Similarity / keyword settings
+# ----- Keyword / similarity settings -----
 TFIDF_NGRAM      = (1, 3)
 TFIDF_MAX_FEAT   = 30000
 TOP_K_CANDIDATES = 4000
 TOP_K_PER_CLASS  = 200
-SIM_THRESHOLD    = 0.35  # semantic similarity threshold used in rules
+SIM_THRESHOLD    = 0.35      # centroid similarity threshold used in rule gating
 
-# Blending rules with ML probs
-ALPHA_RULE_BLEND = 0.55  # weight for rule one-hot added to model proba (0..1)
+# ----- Blending weight (rules + ML probs) -----
+ALPHA_RULE_BLEND = 0.55
 
-# Label mapping
+# ----- Labels -----
 LABEL2ID = {"NEUTRAL": 0, "CONCERN": 1, "COMPLAINT": 2}
 ID2LABEL = {v: k for k, v in LABEL2ID.items()}
 
-
-# ---------------------------
-# Utilities
-# ---------------------------
-def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
-    denom = (norm(a) * norm(b))
-    if denom == 0:
-        return 0.0
-    return float(np.dot(a, b) / denom)
+# =========================
+# Minimal text helpers (optional reuse)
+# =========================
+def chunk_text(text: str, max_chars: int = MAX_CHARS_CHUNK) -> List[str]:
+    t = (text or "").strip()
+    if not t:
+        return []
+    return [t[i:i+max_chars] for i in range(0, len(t), max_chars)]
 
 def text_series(df: pd.DataFrame) -> pd.Series:
     for c in (COL_TEXT_CUST, COL_TEXT_FULL):
@@ -95,24 +96,46 @@ def text_series(df: pd.DataFrame) -> pd.Series:
                 return s
     raise KeyError("No suitable text column found (need customer_light or full_light).")
 
-def chunk_text(t: str, max_chars: int = MAX_CHARS_CHUNK) -> List[str]:
-    t = (t or "").strip()
-    if not t:
-        return []
-    return [t[i:i+max_chars] for i in range(0, len(t), max_chars)]
+def normalize_labels_inplace(df: pd.DataFrame, label_col: str = COL_LABEL) -> None:
+    df[label_col] = (
+        df[label_col]
+        .fillna("NEUTRAL")
+        .astype(str)
+        .str.upper()
+        .str.strip()
+        .replace({
+            "COMPLAINTS": "COMPLAINT",
+            "CONCERNS": "CONCERN",
+            "NULL": "NEUTRAL",
+            "N/A": "NEUTRAL",
+            "": "NEUTRAL"
+        })
+    )
 
-def safe_num(s, default=0.0) -> float:
-    try:
-        return float(s)
-    except Exception:
-        return default
+def prepare_labels(df: pd.DataFrame, label_col: str = COL_LABEL) -> np.ndarray:
+    y = (
+        df[label_col]
+        .fillna("NEUTRAL")
+        .astype(str)
+        .str.upper()
+        .str.strip()
+        .replace({
+            "COMPLAINTS": "COMPLAINT",
+            "CONCERNS": "CONCERN",
+            "NULL": "NEUTRAL",
+            "N/A": "NEUTRAL",
+            "": "NEUTRAL"
+        })
+    )
+    return y.map(LABEL2ID).values
 
-
-# ---------------------------
-# Build data-driven keyword clusters
-# ---------------------------
+# =========================
+# Keyword discovery (data-driven)
+# =========================
 def build_candidate_phrases(texts: List[str]) -> List[str]:
-    """Use TF-IDF to surface candidate n-grams (1..3)."""
+    """
+    Surface candidate 1..3-gram phrases via TF-IDF from TRAIN ONLY.
+    """
     tfidf = TfidfVectorizer(
         max_features=TFIDF_MAX_FEAT,
         ngram_range=TFIDF_NGRAM,
@@ -123,11 +146,11 @@ def build_candidate_phrases(texts: List[str]) -> List[str]:
     )
     X = tfidf.fit_transform(texts)
     vocab = np.array(tfidf.get_feature_names_out())
-    # Get global tf-idf scores (approx by sum over docs)
+    # global importance proxy: sum tfidf per feature
     scores = np.asarray(X.sum(axis=0)).ravel()
     idx = np.argsort(scores)[::-1]
     top = vocab[idx][:TOP_K_CANDIDATES]
-    # prune too short/stopwordy candidates
+    # prune very short & pure stopword terms
     cleaned = []
     for p in top:
         if len(p) < 3:
@@ -144,21 +167,25 @@ def expand_keywords_by_similarity(
     seed_phrases: List[str],
     top_k: int = TOP_K_PER_CLASS
 ) -> Tuple[List[str], np.ndarray]:
-    """Return top_k candidate phrases closest to seed centroid and their embeddings."""
+    """
+    Return top_k candidate phrases closest to the seed centroid and their embeddings (L2-normalized).
+    """
     if not candidates:
         return [], np.zeros((0, model.get_sentence_embedding_dimension()), dtype=np.float32)
-    seed_embs = model.encode(seed_phrases, convert_to_numpy=True, normalize_embeddings=True)
+    seed_embs = model.encode(seed_phrases, convert_to_numpy=True, normalize_embeddings=True, batch_size=64)
     centroid = seed_embs.mean(axis=0)
     cand_embs = model.encode(candidates, convert_to_numpy=True, normalize_embeddings=True, batch_size=256)
     sims = cand_embs @ centroid  # cosine since normalized
     top_idx = np.argsort(sims)[::-1][:top_k]
     return [candidates[i] for i in top_idx], cand_embs[top_idx]
 
-
-# ---------------------------
-# Feature engineering
-# ---------------------------
+# =========================
+# Embeddings & Features
+# =========================
 def embed_transcript(model: SentenceTransformer, text: str) -> np.ndarray:
+    """
+    Encode transcript chunks, average (mean pooling), return L2-normalized vector.
+    """
     chunks = chunk_text(text)
     if not chunks:
         return np.zeros(model.get_sentence_embedding_dimension(), dtype=np.float32)
@@ -172,49 +199,66 @@ def build_feature_matrix(
     comp_kw_emb: np.ndarray,
     con_kw: List[str],
     con_kw_emb: np.ndarray,
-    scaler: MinMaxScaler = None,
+    scaler: Optional[MinMaxScaler] = None,
     fit_scaler: bool = False
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, MinMaxScaler]:
     """
     Returns:
-      X  : fused features [embeddings + counts/sims + numeric + rule flags]
-      meta: array with columns order stored for explainability
+      X       : fused features [embeddings | scaled numeric | rule flags]
+      metaCols: list of names for non-embedding features
+      scaler  : fitted MinMaxScaler
     """
     texts = text_series(df).tolist()
-    # Embeddings
-    emb_list = [embed_transcript(model, t) for t in texts]
-    E = np.vstack(emb_list)  # (N, d)
+    N = len(texts)
 
-    # Lexical counts (simple regex contains)
+    # 1) Embeddings
+    emb_list = [embed_transcript(model, t) for t in texts]
+    E = np.vstack(emb_list)  # (N, d) already normalized
+
+    # 2) Keyword counts
     def count_hits(s: str, kws: List[str]) -> int:
         s_low = s.lower()
         return sum(1 for k in kws if k in s_low)
 
     comp_counts = np.array([count_hits(t, comp_kw) for t in texts], dtype=np.float32)
-    con_counts  = np.array([count_hits(t, con_kw) for t in texts], dtype=np.float32)
+    con_counts  = np.array([count_hits(t, con_kw)  for t in texts], dtype=np.float32)
 
-    # Semantic similarity to keyword centroids
+    # 3) Semantic similarity to keyword centroids
     def centroid(embs: np.ndarray) -> np.ndarray:
-        return (embs.mean(axis=0) if embs.size else np.zeros(E.shape[1], dtype=np.float32)).astype(np.float32)
+        if embs.size == 0:
+            return np.zeros(E.shape[1], dtype=np.float32)
+        return embs.mean(axis=0).astype(np.float32)
+
     comp_centroid = centroid(comp_kw_emb)
     con_centroid  = centroid(con_kw_emb)
 
-    # similarity to centroids
-    sims_comp = (E @ comp_centroid) / (np.linalg.norm(E, axis=1) * (np.linalg.norm(comp_centroid) + 1e-12) + 1e-12)
-    sims_con  = (E @ con_centroid) / (np.linalg.norm(E, axis=1) * (np.linalg.norm(con_centroid)  + 1e-12) + 1e-12)
-    sims_comp = np.nan_to_num(sims_comp, nan=0.0).astype(np.float32)
-    sims_con  = np.nan_to_num(sims_con,  nan=0.0).astype(np.float32)
+    def safe_cosine_to_centroid(mat: np.ndarray, c: np.ndarray) -> np.ndarray:
+        if np.allclose(c, 0.0):
+            return np.zeros((mat.shape[0],), dtype=np.float32)
+        denom = (np.linalg.norm(mat, axis=1) * (np.linalg.norm(c) + 1e-12) + 1e-12)
+        sims = (mat @ c) / denom
+        return np.nan_to_num(sims, nan=0.0).astype(np.float32)
 
-    # Numeric features: loudness and sentiment
-    loud = df.get(COL_LOUDNESS, pd.Series([0]*len(df))).astype(float).values.astype(np.float32)
-    sent = df.get(COL_SENTIMENT, pd.Series([0]*len(df))).astype(float).values.astype(np.float32)
+    sims_comp = safe_cosine_to_centroid(E, comp_centroid)
+    sims_con  = safe_cosine_to_centroid(E, con_centroid)
 
-    # Rule flags
-    rule_complaint = ((loud > LOUD_HIGH_TH) & (sent <= SENT_STRONG_NEG) & ((comp_counts > 0) | (sims_comp >= SIM_THRESHOLD)) ).astype(np.float32)
-    rule_concern   = ((sent > SENT_STRONG_NEG) & (sent <= SENT_MOD_NEG_MAX) & ((con_counts > 0) | (sims_con  >= SIM_THRESHOLD)) ).astype(np.float32)
-    rule_neutral   = ((sent >= NEU_POS_TH) & (comp_counts + con_counts == 0) & (sims_comp < SIM_THRESHOLD) & (sims_con < SIM_THRESHOLD)).astype(np.float32)
+    # 4) Numeric inputs
+    loud = df.get(COL_LOUDNESS, pd.Series([0]*N)).astype(float).values.astype(np.float32)
+    sent = df.get(COL_SENTIMENT, pd.Series([0]*N)).astype(float).values.astype(np.float32)
 
-    # Scale numeric features (not embeddings)
+    # 5) Rules
+    rule_complaint = ((loud > LOUD_HIGH_TH) & (sent <= SENT_STRONG_NEG) &
+                      ((comp_counts > 0) | (sims_comp >= SIM_THRESHOLD))).astype(np.float32)
+
+    rule_concern   = ((sent > SENT_STRONG_NEG) & (sent <= SENT_MOD_NEG_MAX) &
+                      ((con_counts > 0) | (sims_con >= SIM_THRESHOLD))).astype(np.float32)
+
+    rule_neutral   = ((sent >= NEU_POS_TH) &
+                      (comp_counts + con_counts == 0) &
+                      (sims_comp < SIM_THRESHOLD) &
+                      (sims_con  < SIM_THRESHOLD)).astype(np.float32)
+
+    # 6) Scale numeric block (not embeddings)
     numeric = np.vstack([loud, sent, comp_counts, con_counts, sims_comp, sims_con]).T  # (N, 6)
     if scaler is None:
         scaler = MinMaxScaler()
@@ -223,75 +267,81 @@ def build_feature_matrix(
         scaler.fit(numeric)
     numeric_scaled = scaler.transform(numeric).astype(np.float32)
 
-    # Final feature vector: [Embedding | numeric_scaled | rule_flags]
-    X = np.hstack([E, numeric_scaled, rule_complaint.reshape(-1,1), rule_concern.reshape(-1,1), rule_neutral.reshape(-1,1)]).astype(np.float32)
+    # 7) Final fused feature vector
+    X = np.hstack([
+        E,
+        numeric_scaled,
+        rule_complaint.reshape(-1, 1),
+        rule_concern.reshape(-1, 1),
+        rule_neutral.reshape(-1, 1)
+    ]).astype(np.float32)
 
-    meta_cols = [
-        "loudness_scaled","sentiment_scaled","complaint_kw_count_scaled","concern_kw_count_scaled",
-        "sim_comp_scaled","sim_con_scaled","rule_complaint","rule_concern","rule_neutral"
-    ]
-    return X, np.array(meta_cols), scaler
+    meta_cols = np.array([
+        "loudness_scaled", "sentiment_scaled",
+        "complaint_kw_count_scaled", "concern_kw_count_scaled",
+        "sim_comp_scaled", "sim_con_scaled",
+        "rule_complaint", "rule_concern", "rule_neutral"
+    ])
+    return X, meta_cols, scaler
 
-
-# ---------------------------
-# Training / Evaluation
-# ---------------------------
-def prepare_labels(df: pd.DataFrame) -> np.ndarray:
-    y = df[COL_LABEL].fillna("NEUTRAL").astype(str).str.upper().str.strip()
-    y = y.replace({"NULL": "NEUTRAL", "": "NEUTRAL"})
-    return y.map(LABEL2ID).values
+def build_rule_onehot(rule_neu: np.ndarray, rule_con: np.ndarray, rule_comp: np.ndarray) -> np.ndarray:
+    # one-hot-like rows (may have multiple 1s if multiple rules fire)
+    return np.vstack([rule_neu, rule_con, rule_comp]).T.astype(np.float32)
 
 def blended_predict_proba(clf: LogisticRegression, X: np.ndarray, rule_flags: np.ndarray, alpha: float = ALPHA_RULE_BLEND) -> np.ndarray:
     """
-    Blend ML probabilities with one-hot rule signal.
-    rule_flags shape: (N, 3) as [isNeutral, isConcern, isComplaint] OR we’ll build from our three rule booleans.
+    Blend ML probabilities with rule one-hots:
+      blended = softmax( p_ml + alpha * rule )
     """
     proba = clf.predict_proba(X)
-    # Normalize rule flags row-wise before blending (or leave as binary and re-normalize after)
     rf = rule_flags.astype(np.float32)
-    # reweight
     blended = proba + alpha * rf
     blended = blended / blended.sum(axis=1, keepdims=True)
     return blended
 
-def build_rule_onehot(rule_neu: np.ndarray, rule_con: np.ndarray, rule_comp: np.ndarray) -> np.ndarray:
-    # if multiple rules fire, they’ll add mass to multiple classes — acceptable for blending
-    return np.vstack([rule_neu, rule_con, rule_comp]).T.astype(np.float32)
-
+# =========================
+# Training / Evaluation
+# =========================
 def main():
-    # Load data
+    # Load
     df = pd.read_csv(INPUT_CSV)
 
-    # Ensure required columns
-    for col in (COL_TEXT_CUST, COL_LABEL, COL_SENTIMENT, COL_LOUDNESS):
+    # Basic checks
+    for col in (COL_LABEL, COL_TEXT_CUST, COL_SENTIMENT, COL_LOUDNESS):
         if col not in df.columns:
             raise KeyError(f"Missing required column: {col}")
 
-    # Keep only rows with valid labels
-    df[COL_LABEL] = df[COL_LABEL].fillna("NEUTRAL").astype(str).str.upper().str.strip()
+    # Normalize labels, filter to valid set
+    normalize_labels_inplace(df, COL_LABEL)
     df = df[df[COL_LABEL].isin(LABEL2ID.keys())].reset_index(drop=True)
 
-    # Split
+    # 70/15/15 split (stratified)
     train_df, test_df = train_test_split(
         df, test_size=0.15, random_state=RANDOM_SEED, stratify=df[COL_LABEL]
     )
     train_df, val_df  = train_test_split(
         train_df, test_size=0.1765, random_state=RANDOM_SEED, stratify=train_df[COL_LABEL]
-    )  # -> 70/15/15
+    )
 
-    # Model
+    # Show distribution (sanity)
+    for name, d in [("train", train_df), ("val", val_df), ("test", test_df)]:
+        print(name, d[COL_LABEL].value_counts().to_dict())
+
+    # Embedding model
     model = SentenceTransformer(EMBED_MODEL)
 
-    # === Build data-driven keyword sets (use TRAIN ONLY to avoid leakage) ===
+    # === Build data-driven keyword lists from TRAIN ONLY ===
     train_texts = text_series(train_df).tolist()
 
-    # Seeds
     complaint_seeds = [
-        "complaint", "issue", "problem", "not satisfied", "unhappy", "refund", "escalate", "raise a complaint",
-        "poor service", "unacceptable", "bad experience", "charged wrongly"
+        "complaint", "issue", "problem", "not satisfied", "unhappy",
+        "refund", "escalate", "raise a complaint", "poor service",
+        "unacceptable", "bad experience", "charged wrongly", "overcharged",
+        "want to cancel", "manager escalation"
     ]
     concern_seeds = [
-        "concern", "worry", "doubt", "not sure", "need clarification", "query", "question", "unsure", "need help"
+        "concern", "worry", "doubt", "not sure", "need clarification",
+        "query", "question", "unsure", "need help", "confused"
     ]
 
     candidates = build_candidate_phrases(train_texts)
@@ -304,7 +354,7 @@ def main():
     with open(os.path.join(OUTPUT_DIR, "concern_keywords.json"), "w") as f:
         json.dump(con_kw, f, indent=2)
 
-    # === Features & labels ===
+    # === Build features ===
     X_train, meta_cols, scaler = build_feature_matrix(model, train_df, comp_kw, comp_kw_emb, con_kw, con_kw_emb, scaler=None, fit_scaler=True)
     X_val,   _,        _      = build_feature_matrix(model, val_df,   comp_kw, comp_kw_emb, con_kw, con_kw_emb, scaler=scaler, fit_scaler=False)
     X_test,  _,        _      = build_feature_matrix(model, test_df,  comp_kw, comp_kw_emb, con_kw, con_kw_emb, scaler=scaler, fit_scaler=False)
@@ -313,9 +363,8 @@ def main():
     y_val   = prepare_labels(val_df)
     y_test  = prepare_labels(test_df)
 
-    # Extract rule flags again for blending (last three columns in X are our rule flags)
+    # Extract rule flags (last 3 columns in X are rule_comp, rule_con, rule_neu)
     def split_rule_flags(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        # X = [emb | 6 scaled numeric | rule_comp | rule_con | rule_neu]
         rule_comp = X[:, -3]
         rule_con  = X[:, -2]
         rule_neu  = X[:, -1]
@@ -325,26 +374,39 @@ def main():
     rneu_va, rcon_va, rcomp_va = split_rule_flags(X_val)
     rneu_te, rcon_te, rcomp_te = split_rule_flags(X_test)
 
-    # Train multinomial Logistic Regression on fused features
+    # =========================
+    # Train multinomial LR on fused features
+    # =========================
     clf = LogisticRegression(
         max_iter=1500,
         class_weight="balanced",
-        multi_class="multinomial",
+        multi_class="auto",      # quiets sklearn deprecation
         solver="lbfgs",
         random_state=RANDOM_SEED
     )
     clf.fit(X_train, y_train)
 
-    # Evaluate (pure ML)
-    y_pred_val = clf.predict(X_val)
-    y_pred_tst = clf.predict(X_test)
+    # ---- Pure ML reports ----
     print("\n=== Pure ML (no blending) ===")
+    y_pred_val = clf.predict(X_val)
     print("Validation:")
-    print(classification_report(y_val, y_pred_val, target_names=["NEUTRAL","CONCERN","COMPLAINT"]))
+    print(classification_report(
+        y_val, y_pred_val,
+        labels=[0,1,2],
+        target_names=["NEUTRAL","CONCERN","COMPLAINT"],
+        zero_division=0
+    ))
+    y_pred_tst = clf.predict(X_test)
     print("Test:")
-    print(classification_report(y_test, y_pred_tst, target_names=["NEUTRAL","CONCERN","COMPLAINT"]))
+    print(classification_report(
+        y_test, y_pred_tst,
+        labels=[0,1,2],
+        target_names=["NEUTRAL","CONCERN","COMPLAINT"],
+        zero_division=0
+    ))
 
-    # Evaluate (blended with rules)
+    # ---- Hybrid blending (rules + ML probs) ----
+    print("\n=== Hybrid (ML + rule blending) ===")
     rule_onehot_val = build_rule_onehot(rneu_va, rcon_va, rcomp_va)
     rule_onehot_tst = build_rule_onehot(rneu_te, rcon_te, rcomp_te)
 
@@ -354,27 +416,114 @@ def main():
     y_pred_val_blend = np.argmax(proba_val_blend, axis=1)
     y_pred_tst_blend = np.argmax(proba_tst_blend, axis=1)
 
-    print("\n=== Hybrid (ML + rule blending) ===")
     print("Validation:")
-    print(classification_report(y_val, y_pred_val_blend, target_names=["NEUTRAL","CONCERN","COMPLAINT"]))
+    print(classification_report(
+        y_val, y_pred_val_blend,
+        labels=[0,1,2],
+        target_names=["NEUTRAL","CONCERN","COMPLAINT"],
+        zero_division=0
+    ))
     print("Test:")
-    print(classification_report(y_test, y_pred_tst_blend, target_names=["NEUTRAL","CONCERN","COMPLAINT"]))
+    print(classification_report(
+        y_test, y_pred_tst_blend,
+        labels=[0,1,2],
+        target_names=["NEUTRAL","CONCERN","COMPLAINT"],
+        zero_division=0
+    ))
 
+    # =========================
     # Save artifacts
+    # =========================
     joblib.dump(clf, os.path.join(OUTPUT_DIR, "hybrid_logreg.joblib"))
     joblib.dump(scaler, os.path.join(OUTPUT_DIR, "numeric_scaler.joblib"))
     with open(os.path.join(OUTPUT_DIR, "meta_cols.json"), "w") as f:
         json.dump({"meta_cols": meta_cols.tolist()}, f)
     with open(os.path.join(OUTPUT_DIR, "embed_model.txt"), "w") as f:
         f.write(EMBED_MODEL)
+    with open(os.path.join(OUTPUT_DIR, "label_mapping.json"), "w") as f:
+        json.dump({"LABEL2ID": LABEL2ID, "ID2LABEL": ID2LABEL}, f, indent=2)
 
     print(f"\nArtifacts saved to: {OUTPUT_DIR}")
-    print("Files:")
     print(" - hybrid_logreg.joblib")
     print(" - numeric_scaler.joblib")
     print(" - complaint_keywords.json / concern_keywords.json")
     print(" - meta_cols.json")
     print(" - embed_model.txt")
+    print(" - label_mapping.json")
 
+
+# =========================
+# Inference (batch)
+# =========================
+def inference(input_csv: str,
+              artifacts_dir: str = OUTPUT_DIR,
+              output_csv: str = "predictions_output.csv",
+              blend_with_rules: bool = True,
+              alpha: float = ALPHA_RULE_BLEND) -> pd.DataFrame:
+    """
+    Load artifacts and score a new CSV. Writes predictions with probabilities.
+    """
+    # Load data
+    df_new = pd.read_csv(input_csv)
+    normalize_labels_inplace(df_new, COL_LABEL)  # ok if label missing; we won't use it
+
+    # Load artifacts
+    clf = joblib.load(os.path.join(artifacts_dir, "hybrid_logreg.joblib"))
+    scaler = joblib.load(os.path.join(artifacts_dir, "numeric_scaler.joblib"))
+    with open(os.path.join(artifacts_dir, "embed_model.txt"), "r") as f:
+        emb_name = f.read().strip()
+    model = SentenceTransformer(emb_name)
+
+    with open(os.path.join(artifacts_dir, "complaint_keywords.json"), "r") as f:
+        comp_kw = json.load(f)
+    with open(os.path.join(artifacts_dir, "concern_keywords.json"), "r") as f:
+        con_kw = json.load(f)
+
+    # Recompute keyword centroid embeddings
+    # (Fast enough; avoids saving extra files.)
+    # If you want to cache, persist comp_kw_emb / con_kw_emb during training.
+    candidates_for_emb = comp_kw + con_kw
+    if candidates_for_emb:
+        all_embs = model.encode(candidates_for_emb, convert_to_numpy=True, normalize_embeddings=True, batch_size=256)
+        comp_kw_emb = all_embs[:len(comp_kw)]
+        con_kw_emb  = all_embs[len(comp_kw):]
+    else:
+        comp_kw_emb = np.zeros((0, model.get_sentence_embedding_dimension()), dtype=np.float32)
+        con_kw_emb  = np.zeros((0, model.get_sentence_embedding_dimension()), dtype=np.float32)
+
+    # Build features
+    X_new, _, _ = build_feature_matrix(model, df_new, comp_kw, comp_kw_emb, con_kw, con_kw_emb, scaler=scaler, fit_scaler=False)
+
+    # Predict
+    proba_ml = clf.predict_proba(X_new)
+    if blend_with_rules:
+        # build rule one-hot from last 3 columns
+        rule_comp = X_new[:, -3]
+        rule_con  = X_new[:, -2]
+        rule_neu  = X_new[:, -1]
+        rule_onehot = build_rule_onehot(rule_neu, rule_con, rule_comp)
+        proba = blended_predict_proba(clf, X_new, rule_onehot, alpha=alpha)
+    else:
+        proba = proba_ml
+
+    y_hat = np.argmax(proba, axis=1)
+    preds = [ID2LABEL[i] for i in y_hat]
+
+    # Attach to dataframe
+    df_new["pred_class"] = preds
+    df_new["proba_NEUTRAL"]   = proba[:, 0]
+    df_new["proba_CONCERN"]   = proba[:, 1]
+    df_new["proba_COMPLAINT"] = proba[:, 2]
+
+    df_new.to_csv(output_csv, index=False)
+    print(f"Saved predictions to: {output_csv}")
+    return df_new
+
+
+# =========================
+# Entrypoint
+# =========================
 if __name__ == "__main__":
     main()
+    # Example inference call (uncomment to run after training):
+    # inference("unseen_calls.csv", artifacts_dir=OUTPUT_DIR, output_csv="unseen_predictions.csv")
