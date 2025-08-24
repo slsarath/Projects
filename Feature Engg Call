@@ -1,0 +1,99 @@
+Perfect — you’ve got a full end-to-end script already.
+Let me break this down so you know exactly where to change paths/locations on your computer and what steps to run for both training and future inference.
+
+⸻
+
+🔧 Places to Change on Your Computer
+
+In your script:
+	1.	Input CSV (raw transcripts file)
+
+INPUT_CSV = "input_transcripts.csv"
+
+➝ Replace "input_transcripts.csv" with the full path to your actual data file.
+Example:
+
+INPUT_CSV = "C:/Users/Sho/Documents/projects/transcripts_raw.csv"
+
+
+	2.	Artifacts / Output Directory
+
+OUTPUT_DIR = "artifacts"
+
+➝ Change "artifacts" to the folder where you want models, matrices, engineered CSVs, etc. to be saved.
+Example:
+
+OUTPUT_DIR = "C:/Users/Sho/Documents/projects/transcript_artifacts"
+
+
+	3.	Inference utility call (when predicting later):
+
+inference("new_transcripts.csv", artifacts_dir=OUTPUT_DIR, output_csv="predictions_output.csv")
+
+➝ Replace "new_transcripts.csv" with the path of your future unseen dataset.
+➝ Replace "predictions_output.csv" with where you want the predictions saved.
+Example:
+
+inference("C:/Users/Sho/Documents/projects/new_calls.csv",
+          artifacts_dir="C:/Users/Sho/Documents/projects/transcript_artifacts",
+          output_csv="C:/Users/Sho/Documents/projects/new_calls_scored.csv")
+
+
+
+⸻
+
+🚀 Steps to Run on Your Data
+
+Step 1. Training + Saving Artifacts
+	1.	Place your transcript dataset (like the Excel screenshot you shared, saved as CSV) somewhere on your system.
+Let’s say:
+C:/Users/Sho/Documents/projects/transcripts_raw.csv
+	2.	Edit the script:
+
+INPUT_CSV = "C:/Users/Sho/Documents/projects/transcripts_raw.csv"
+OUTPUT_DIR = "C:/Users/Sho/Documents/projects/transcript_artifacts"
+
+
+	3.	Run the script (either in terminal or VSCode):
+
+python fe_train.py
+
+(assuming you saved the big script as fe_train.py).
+
+	4.	After running, you’ll get inside your OUTPUT_DIR:
+	•	tfidf.joblib, scaler.joblib, mlb.joblib → preprocessing artifacts
+	•	embed_model.txt → embedding model used
+	•	fe_Xsparse.npz, fe_Xdense.npy, fe_meta.csv → engineered features
+	•	transcripts_engineered.csv → enriched dataframe
+	•	complaint_concern_model.joblib → binary model (if enough data)
+	•	multiclass_model.joblib → multiclass model (if enough data)
+	•	embeddings.npy → raw embeddings only
+
+⸻
+
+Step 2. Inference on New Data
+
+Whenever you have new transcripts to score:
+
+from fe_train import inference
+
+pred_df = inference(
+    input_csv="C:/Users/Sho/Documents/projects/new_calls.csv",
+    artifacts_dir="C:/Users/Sho/Documents/projects/transcript_artifacts",
+    output_csv="C:/Users/Sho/Documents/projects/new_calls_scored.csv"
+)
+
+	•	pred_df → pandas dataframe with predictions appended.
+	•	You’ll also find the predictions saved as new_calls_scored.csv.
+
+⸻
+
+✅ That’s it.
+The only places you edit:
+	•	INPUT_CSV (raw data path)
+	•	OUTPUT_DIR (folder for models + outputs)
+	•	paths passed into inference() when you want to predict.
+
+⸻
+
+Do you want me to also give you a minimal driver script (separate .py file) just for inference only so you don’t touch the big training file again?
