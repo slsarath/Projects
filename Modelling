@@ -1,147 +1,136 @@
-# complaint_concern_pipeline.py
+# Modelling.py
 
-import numpy as np
 import pandas as pd
+import numpy as np
+
 from sklearn.model_selection import train_test_split
-from sklearn.utils.class_weight import compute_class_weight, resample
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report, confusion_matrix
+from imblearn.over_sampling import SMOTE
 
-# ---------------------------------------------------
-# 1. Data Preparation
-# ---------------------------------------------------
+# =====================================================
+# 1. Load dataset
+# =====================================================
+def load_data(path="transcripts.csv"):
+    df = pd.read_csv(path)
+
+    # Drop rows where label is missing
+    df = df.dropna(subset=["Materiality"])
+    df["Materiality"] = df["Materiality"].astype(str)
+
+    return df
+
+
+# =====================================================
+# 2. Prepare features
+# =====================================================
 def prepare_features(df, label_col="Materiality"):
     """
-    Expects df with:
-        - label_col = 'Complaint' or 'Concern'
-        - All other engineered features already numeric (TF-IDF, embeddings, sentiment, cost, tags)
+    Prepares X, y for modeling:
+      - Separates numeric and categorical features
+      - One-hot encodes categoricals
     """
-    X = df.drop(columns=[label_col])
     y = df[label_col]
-    return X, y
 
+    # Drop IDs or text cols not needed in baseline model
+    drop_cols = [label_col, "call_id", "transcript", "clean_customer_only"]
+    X = df.drop(columns=[c for c in drop_cols if c in df.columns])
 
-def stratified_split(X, y, test_size=0.2, random_state=42):
-    return train_test_split(
-        X, y,
-        test_size=test_size,
-        stratify=y,
-        random_state=random_state
+    # Separate feature types
+    numeric_features = X.select_dtypes(include=[np.number]).columns.tolist()
+    categorical_features = X.select_dtypes(exclude=[np.number]).columns.tolist()
+
+    print("Numeric features:", numeric_features)
+    print("Categorical features:", categorical_features)
+
+    # Column transformer for preprocessing
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", "passthrough", numeric_features),
+            ("cat", OneHotEncoder(handle_unknown="ignore"), categorical_features)
+        ]
     )
 
-# ---------------------------------------------------
-# 2. Balancing
-# ---------------------------------------------------
-def compute_weights(y_train):
-    classes = np.unique(y_train)
-    weights = compute_class_weight(class_weight='balanced', classes=classes, y=y_train)
-    return dict(zip(classes, weights))
+    return X, y, preprocessor
 
 
-def oversample_minority(X_train, y_train, random_state=42):
-    train_df = pd.concat([X_train, y_train], axis=1)
-
-    majority_class = y_train.value_counts().idxmax()
-    minority_class = y_train.value_counts().idxmin()
-
-    df_major = train_df[train_df['Materiality'] == majority_class]
-    df_minor = train_df[train_df['Materiality'] == minority_class]
-
-    df_minor_up = resample(
-        df_minor,
-        replace=True,
-        n_samples=len(df_major),
-        random_state=random_state
-    )
-
-    df_bal = pd.concat([df_major, df_minor_up])
-    X_bal, y_bal = df_bal.drop(columns=['Materiality']), df_bal['Materiality']
+# =====================================================
+# 3. Handle imbalance with SMOTE
+# =====================================================
+def balance_data(X, y):
+    smote = SMOTE(random_state=42)
+    X_bal, y_bal = smote.fit_resample(X, y)
     return X_bal, y_bal
 
-# ---------------------------------------------------
-# 3. Training
-# ---------------------------------------------------
-def train_models(X_train, y_train, X_bal, y_bal, class_weight_dict):
-    models = {}
 
-    # Logistic Regression
-    models["Logistic (class weights)"] = LogisticRegression(
-        max_iter=1000, class_weight=class_weight_dict, random_state=42
-    ).fit(X_train, y_train)
+# =====================================================
+# 4. Train models (Logistic Regression + Random Forest)
+# =====================================================
+def train_models(X_train, y_train, X_bal, y_bal, class_weight_dict, preprocessor):
+    models = {
+        "Logistic Regression": Pipeline([
+            ("preprocessor", preprocessor),
+            ("clf", LogisticRegression(max_iter=1000, class_weight=class_weight_dict))
+        ]),
+        "Random Forest": Pipeline([
+            ("preprocessor", preprocessor),
+            ("clf", RandomForestClassifier(class_weight=class_weight_dict, random_state=42))
+        ])
+    }
 
-    models["Logistic (oversample)"] = LogisticRegression(
-        max_iter=1000, random_state=42
-    ).fit(X_bal, y_bal)
-
-    # Random Forest
-    models["RandomForest (class weights)"] = RandomForestClassifier(
-        n_estimators=100, class_weight=class_weight_dict, random_state=42
-    ).fit(X_train, y_train)
-
-    models["RandomForest (oversample)"] = RandomForestClassifier(
-        n_estimators=100, random_state=42
-    ).fit(X_bal, y_bal)
-
-    return models
-
-# ---------------------------------------------------
-# 4. Evaluation
-# ---------------------------------------------------
-def evaluate_models(models, X_test, y_test):
-    summary = []
+    trained_models = {}
     for name, model in models.items():
+        print(f"\nTraining {name}...")
+        model.fit(X_train, y_train)
+        trained_models[name] = model
+
+    return trained_models
+
+
+# =====================================================
+# 5. Evaluate models
+# =====================================================
+def evaluate_models(models, X_test, y_test):
+    for name, model in models.items():
+        print(f"\nEvaluating {name}...")
         y_pred = model.predict(X_test)
-
-        print(f"{name} Report:")
+        print(confusion_matrix(y_test, y_pred))
         print(classification_report(y_test, y_pred))
-        print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred))
-        print("-"*60)
 
-        # Collect summary
-        report_dict = classification_report(
-            y_test, y_pred, output_dict=True
-        )
-        summary.append({
-            "Model": name,
-            "F1 (Complaint)": report_dict["Complaint"]["f1-score"],
-            "F1 (Concern)": report_dict["Concern"]["f1-score"],
-            "F1 (Macro)": report_dict["macro avg"]["f1-score"]
-        })
 
-    summary_df = pd.DataFrame(summary)
-    print("\n=== F1 Score Summary ===")
-    print(summary_df.to_string(index=False))
-    return summary_df
-
-# ---------------------------------------------------
-# 5. Main pipeline
-# ---------------------------------------------------
+# =====================================================
+# 6. Main pipeline
+# =====================================================
 def main():
-    # Load your dataset here (already with features engineered in Step 3)
-    df = pd.read_csv("your_featured_dataset.csv")   # <---- Replace with your actual file
+    # Load data
+    df = load_data("transcripts.csv")
 
-    # Step 1: Prepare features/labels
-    X, y = prepare_features(df, label_col="Materiality")
+    # Prepare features
+    X, y, preprocessor = prepare_features(df, label_col="Materiality")
 
-    X_train, X_test, y_train, y_test = stratified_split(X, y)
-    print("Train class counts:\n", y_train.value_counts())
-    print("Test class counts:\n", y_test.value_counts())
-    print("="*60)
+    # Train/test split
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=42
+    )
 
-    # Step 2: Handle imbalance
-    class_weight_dict = compute_weights(y_train)
-    print("Class Weights:", class_weight_dict)
+    # Handle imbalance
+    X_bal, y_bal = balance_data(X_train, y_train)
 
-    X_bal, y_bal = oversample_minority(X_train, y_train)
-    print("Balanced train counts:\n", y_bal.value_counts())
-    print("="*60)
+    # Class weights (for imbalance handling)
+    class_weight_dict = y_train.value_counts(normalize=True).to_dict()
+    class_weight_dict = {k: 1/v for k, v in class_weight_dict.items()}  # inverse frequency
 
-    # Step 3: Train
-    models = train_models(X_train, y_train, X_bal, y_bal, class_weight_dict)
+    print("Class weights:", class_weight_dict)
 
-    # Step 4: Evaluate
-    _ = evaluate_models(models, X_test, y_test)
+    # Train models
+    models = train_models(X_train, y_train, X_bal, y_bal, class_weight_dict, preprocessor)
+
+    # Evaluate
+    evaluate_models(models, X_test, y_test)
 
 
 if __name__ == "__main__":
