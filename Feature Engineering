@@ -1,0 +1,188 @@
+import pandas as pd
+import numpy as np
+
+# Text vectorization
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import MinMaxScaler
+
+# Sentence embeddings
+from sentence_transformers import SentenceTransformer, util
+
+# HuggingFace Transformers (RoBERTa Twitter sentiment)
+from transformers import pipeline
+
+# ---------------------------------------------------
+# 1. Load your dataset
+# ---------------------------------------------------
+df = pd.read_csv("transcripts.csv")
+
+# Key columns as per your clarification
+TEXT_COL = "clean_customer_only"
+SENTIMENT_SCORE_COL = "Max negative customer score"
+COST_COL = "Total cost"
+
+# ---------------------------------------------------
+# 2. Normalize numeric features
+# ---------------------------------------------------
+df[COST_COL] = pd.to_numeric(df[COST_COL].astype(str).str.replace(r"[^\d.]", "", regex=True),
+                             errors="coerce")
+
+scaler = MinMaxScaler()
+df[[SENTIMENT_SCORE_COL, COST_COL]] = scaler.fit_transform(
+    df[[SENTIMENT_SCORE_COL, COST_COL]]
+)
+
+# ---------------------------------------------------
+# 3. Text features - TFIDF and embeddings
+# ---------------------------------------------------
+tfidf = TfidfVectorizer(max_features=5000, ngram_range=(1,2))
+X_tfidf = tfidf.fit_transform(df[TEXT_COL].fillna(""))
+
+models = {
+    "mpnet": SentenceTransformer("sentence-transformers/all-mpnet-base-v2"),
+    "minilm": SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2"),
+    "distilbert": SentenceTransformer("sentence-transformers/all-distilroberta-v1")
+}
+
+embeddings = {}
+for name, model in models.items():
+    embeddings[name] = model.encode(df[TEXT_COL].fillna("").tolist(),
+                                    batch_size=32,
+                                    show_progress_bar=True)
+
+# ---------------------------------------------------
+# 4. RoBERTa Twitter sentiment
+# ---------------------------------------------------
+sentiment_pipe = pipeline("sentiment-analysis",
+                          model="cardiffnlp/twitter-roberta-base-sentiment")
+
+roberta_preds = []
+for text in df[TEXT_COL].fillna("").tolist():
+    try:
+        out = sentiment_pipe(text[:512])[0]  # truncate >512 tokens
+        roberta_preds.append({
+            "roberta_label": out["label"],
+            "roberta_score": out["score"]
+        })
+    except Exception:
+        roberta_preds.append({"roberta_label": None, "roberta_score": None})
+
+roberta_df = pd.DataFrame(roberta_preds)
+df = pd.concat([df.reset_index(drop=True), roberta_df], axis=1)
+
+# ---------------------------------------------------
+# 5. Full Semantic Tagging Dictionary (from 2 tables)
+# ---------------------------------------------------
+semantic_tagging_dict = {
+    "Probable_Complaints": {
+        "Financial_Difficulties": {
+            "priority": "High",
+            "keywords": [
+                "missed payment", "can't pay bills", "financial hardship",
+                "overdraft", "late fees", "struggling with money",
+                "unable to repay", "defaulted", "debt issue"
+            ]
+        },
+        "Refund": {
+            "priority": "High",
+            "keywords": [
+                "refund", "money back", "reversal of charges",
+                "reimburse", "return my payment", "need my money back"
+            ]
+        },
+        "Disconnected_Callers": {
+            "priority": "High",
+            "keywords": [
+                "call dropped", "line cut", "lost connection",
+                "disconnected", "hung up unexpectedly"
+            ]
+        },
+        "High_Call_Charges": {
+            "priority": "Medium",
+            "keywords": [
+                "high call charges", "charged too much",
+                "extra fee on call", "unexpected charges"
+            ]
+        },
+        "Insurance_Related": {
+            "priority": "Medium",
+            "keywords": [
+                "insurance claim", "policy issue", "not covered",
+                "premium problem", "insurance denied"
+            ]
+        }
+    },
+    "Probable_Concerns": {
+        "Fraud_Scam": {
+            "priority": "High",
+            "keywords": [
+                "fraudulent", "scam", "unauthorized charge",
+                "identity theft", "fake call", "phishing"
+            ]
+        },
+        "Card_Replacement": {
+            "priority": "High",
+            "keywords": [
+                "lost my card", "stolen card", "replace card",
+                "new card", "block my card"
+            ]
+        },
+        "Transaction_Declined": {
+            "priority": "Medium",
+            "keywords": [
+                "transaction declined", "payment failed",
+                "didn't go through", "card declined"
+            ]
+        },
+        "EMI_Related": {
+            "priority": "Medium",
+            "keywords": [
+                "emi issue", "installment problem",
+                "monthly payment trouble", "emi deduction wrong"
+            ]
+        },
+        "Loan_Related": {
+            "priority": "Medium",
+            "keywords": [
+                "loan status", "loan not approved",
+                "need loan help", "loan rejected",
+                "interest rate on loan"
+            ]
+        }
+    }
+}
+
+# ---------------------------------------------------
+# 6. Semantic Tagging Function
+# ---------------------------------------------------
+model_for_tagging = models["minilm"]  # small + fast for semantic search
+
+def tag_transcript(text, threshold=0.55):
+    text = text.lower()
+    tags = []
+    text_emb = model_for_tagging.encode(text, convert_to_tensor=True)
+
+    for category, subcats in semantic_tagging_dict.items():
+        for subcat, info in subcats.items():
+            # Direct keyword match
+            for kw in info["keywords"]:
+                if kw in text:
+                    tags.append(subcat)
+                    break
+            # Semantic similarity match
+            kw_emb = model_for_tagging.encode(info["keywords"], convert_to_tensor=True)
+            sim_scores = util.cos_sim(text_emb, kw_emb).cpu().numpy().flatten()
+            if sim_scores.max() >= threshold:
+                tags.append(subcat)
+    return list(set(tags)) if tags else None
+
+df["semantic_tags"] = df[TEXT_COL].fillna("").apply(tag_transcript)
+
+# ---------------------------------------------------
+# Final outputs
+# ---------------------------------------------------
+print("TF-IDF shape:", X_tfidf.shape)
+for k, v in embeddings.items():
+    print(f"{k} embeddings shape:", v.shape)
+
+print(df[["clean_customer_only", "semantic_tags", "roberta_label", "roberta_score"]].head())
