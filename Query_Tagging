@@ -1,0 +1,150 @@
+import pandas as pd
+
+# Assume your dataframe has a column "Materiality_Tag" with values:
+# "COMPLAINTS", "CONCERNS", "NEUTRAL"
+
+# Desired sample size
+sample_size = 3000
+
+# Count how many unique tags
+tags = df['Materiality_Tag'].unique()
+n_tags = len(tags)
+
+# How many samples per tag
+samples_per_tag = sample_size // n_tags  # integer division
+
+# Stratified sampling
+sampled_df = (
+    df.groupby('Materiality_Tag', group_keys=False)
+      .apply(lambda x: x.sample(n=min(len(x), samples_per_tag), random_state=42))
+)
+
+# If your total ends up slightly less than 3000 due to some tags having < samples_per_tag,
+# you can sample the remaining from the leftover rows
+remaining = sample_size - len(sampled_df)
+if remaining > 0:
+    leftover = df.drop(sampled_df.index)
+    extra = leftover.sample(n=remaining, random_state=42)
+    sampled_df = pd.concat([sampled_df, extra])
+
+# Check distribution
+print(sampled_df['Materiality_Tag'].value_counts())
+
+import re
+import pandas as pd
+from textblob import TextBlob
+
+# ----------------------------
+# Step 1: Define tagging lists
+# ----------------------------
+complaints_tags = [
+    "Financial Difficulties", "Vulnerable Consent Statement", "Disconnected Callers",
+    "High Risk Vulnerable Mental Health RT", "Everyday Saver", "Test CTV",
+    "Bridging Question Vulnerable High Risk", "Complaints Existing", "Refund",
+    "Refer From Branch", "Chat To Voice", "RT Dissat Sentiment Test",
+    "High Risk Vulnerable Mental Health", "Complaints New", "complaint"
+]
+
+concerns_tags = [
+    "Card Replacement", "PinSentry", "ISA", "Digital Banking Registration", "Fraud Scam",
+    "Continuous Authority", "Response To Contact Letter", "Lost And Stolen Enquiry",
+    "Scripting", "Interest Rate Query", "Potential Call Disconnect", "Disputed Transactions",
+    "Customer Confusion", "Digital Error Code", "concern"
+]
+
+# Normalize tags (lowercase, no spaces/underscores)
+def normalize(text):
+    return re.sub(r'[_\s]+', ' ', text.strip().lower())
+
+complaints_tags = [normalize(t) for t in complaints_tags]
+concerns_tags = [normalize(t) for t in concerns_tags]
+
+# ----------------------------
+# Step 2: Preprocess transcripts
+# ----------------------------
+def preprocess_transcript(text):
+    """
+    Extract only CUSTOMER lines, strip markers/PII, normalize spacing.
+    """
+    customer_lines = []
+    for line in text.splitlines():
+        if line.strip().startswith("CUSTOMER"):
+            # Remove label
+            line = line.replace("CUSTOMER", "").strip()
+            customer_lines.append(line)
+
+    # Join into single text
+    customer_text = " ".join(customer_lines)
+
+    # Remove placeholders like [PII]
+    customer_text = re.sub(r"\[.*?\]", "", customer_text)
+
+    # Normalize whitespace
+    customer_text = re.sub(r"\s+", " ", customer_text).strip()
+
+    return customer_text
+
+# ----------------------------
+# Step 3: Sentiment analysis
+# ----------------------------
+def get_sentiment_score(text):
+    if not text or text.isspace():
+        return 0.0
+    blob = TextBlob(text)
+    return blob.sentiment.polarity  # -1 (negative) to +1 (positive)
+
+# ----------------------------
+# Step 4: Categorization
+# ----------------------------
+def categorize_transcript(text):
+    text_norm = normalize(text)
+
+    # Check complaint tags
+    for tag in complaints_tags:
+        if tag in text_norm:
+            return "COMPLAINTS"
+
+    # Check concern tags
+    for tag in concerns_tags:
+        if tag in text_norm:
+            return "CONCERNS"
+
+    return "NEUTRAL"
+
+# ----------------------------
+# Step 5: Example workflow
+# ----------------------------
+data = [
+    # Realistic transcript example
+    """AGENT
+    Oh
+    AGENT
+    And thank you so much for your patience on the automated system. My name is [PII]. How may I help you 
+    CUSTOMER
+    I'd like to make a complaint please.
+    AGENT
+    Absolutely, um, is it OK if I take you through a bit of security and ask what it is all about and help you furt 
+    CUSTOMER
+    Yeah.
+    AGENT
+    OK, may you please confirm your first and last name, please.
+    CUSTOMER [PII].
+    AGENT
+    Thank you, Mrs. [PII]. I'll be sending you a passcode to your mobile number that ends in [PII].
+    CUSTOMER
+    Oh, hang on, I haven't got my phone with me. Hang on, I'll just, l'll just hav
+    AGENT
+    I'll wait.
+    """
+]
+
+df = pd.DataFrame(data, columns=["Transcript"])
+
+# Preprocess to extract customer-only speech
+df["Transcript_Clean"] = df["Transcript"].apply(preprocess_transcript)
+
+# Apply sentiment + categorization
+df["Sentiment"] = df["Transcript_Clean"].apply(get_sentiment_score)
+df["Category"] = df["Transcript_Clean"].apply(categorize_transcript)
+
+print(df[["Transcript_Clean", "Sentiment", "Category"]])
