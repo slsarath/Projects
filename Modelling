@@ -1,0 +1,148 @@
+# complaint_concern_pipeline.py
+
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight, resample
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, confusion_matrix
+
+# ---------------------------------------------------
+# 1. Data Preparation
+# ---------------------------------------------------
+def prepare_features(df, label_col="Materiality"):
+    """
+    Expects df with:
+        - label_col = 'Complaint' or 'Concern'
+        - All other engineered features already numeric (TF-IDF, embeddings, sentiment, cost, tags)
+    """
+    X = df.drop(columns=[label_col])
+    y = df[label_col]
+    return X, y
+
+
+def stratified_split(X, y, test_size=0.2, random_state=42):
+    return train_test_split(
+        X, y,
+        test_size=test_size,
+        stratify=y,
+        random_state=random_state
+    )
+
+# ---------------------------------------------------
+# 2. Balancing
+# ---------------------------------------------------
+def compute_weights(y_train):
+    classes = np.unique(y_train)
+    weights = compute_class_weight(class_weight='balanced', classes=classes, y=y_train)
+    return dict(zip(classes, weights))
+
+
+def oversample_minority(X_train, y_train, random_state=42):
+    train_df = pd.concat([X_train, y_train], axis=1)
+
+    majority_class = y_train.value_counts().idxmax()
+    minority_class = y_train.value_counts().idxmin()
+
+    df_major = train_df[train_df['Materiality'] == majority_class]
+    df_minor = train_df[train_df['Materiality'] == minority_class]
+
+    df_minor_up = resample(
+        df_minor,
+        replace=True,
+        n_samples=len(df_major),
+        random_state=random_state
+    )
+
+    df_bal = pd.concat([df_major, df_minor_up])
+    X_bal, y_bal = df_bal.drop(columns=['Materiality']), df_bal['Materiality']
+    return X_bal, y_bal
+
+# ---------------------------------------------------
+# 3. Training
+# ---------------------------------------------------
+def train_models(X_train, y_train, X_bal, y_bal, class_weight_dict):
+    models = {}
+
+    # Logistic Regression
+    models["Logistic (class weights)"] = LogisticRegression(
+        max_iter=1000, class_weight=class_weight_dict, random_state=42
+    ).fit(X_train, y_train)
+
+    models["Logistic (oversample)"] = LogisticRegression(
+        max_iter=1000, random_state=42
+    ).fit(X_bal, y_bal)
+
+    # Random Forest
+    models["RandomForest (class weights)"] = RandomForestClassifier(
+        n_estimators=100, class_weight=class_weight_dict, random_state=42
+    ).fit(X_train, y_train)
+
+    models["RandomForest (oversample)"] = RandomForestClassifier(
+        n_estimators=100, random_state=42
+    ).fit(X_bal, y_bal)
+
+    return models
+
+# ---------------------------------------------------
+# 4. Evaluation
+# ---------------------------------------------------
+def evaluate_models(models, X_test, y_test):
+    summary = []
+    for name, model in models.items():
+        y_pred = model.predict(X_test)
+
+        print(f"{name} Report:")
+        print(classification_report(y_test, y_pred))
+        print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred))
+        print("-"*60)
+
+        # Collect summary
+        report_dict = classification_report(
+            y_test, y_pred, output_dict=True
+        )
+        summary.append({
+            "Model": name,
+            "F1 (Complaint)": report_dict["Complaint"]["f1-score"],
+            "F1 (Concern)": report_dict["Concern"]["f1-score"],
+            "F1 (Macro)": report_dict["macro avg"]["f1-score"]
+        })
+
+    summary_df = pd.DataFrame(summary)
+    print("\n=== F1 Score Summary ===")
+    print(summary_df.to_string(index=False))
+    return summary_df
+
+# ---------------------------------------------------
+# 5. Main pipeline
+# ---------------------------------------------------
+def main():
+    # Load your dataset here (already with features engineered in Step 3)
+    df = pd.read_csv("your_featured_dataset.csv")   # <---- Replace with your actual file
+
+    # Step 1: Prepare features/labels
+    X, y = prepare_features(df, label_col="Materiality")
+
+    X_train, X_test, y_train, y_test = stratified_split(X, y)
+    print("Train class counts:\n", y_train.value_counts())
+    print("Test class counts:\n", y_test.value_counts())
+    print("="*60)
+
+    # Step 2: Handle imbalance
+    class_weight_dict = compute_weights(y_train)
+    print("Class Weights:", class_weight_dict)
+
+    X_bal, y_bal = oversample_minority(X_train, y_train)
+    print("Balanced train counts:\n", y_bal.value_counts())
+    print("="*60)
+
+    # Step 3: Train
+    models = train_models(X_train, y_train, X_bal, y_bal, class_weight_dict)
+
+    # Step 4: Evaluate
+    _ = evaluate_models(models, X_test, y_test)
+
+
+if __name__ == "__main__":
+    main()
