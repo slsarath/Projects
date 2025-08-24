@@ -91,8 +91,9 @@ def lemmatize_keep_negations(text: str) -> str:
     for tok in doc:
         if tok.is_space:
             continue
-        if tok.text == SEP_TOKEN:  # preserve separator
-            out.append(SEP_TOKEN)
+        # --- Fix: protect [SEP] (and any other special tokens in brackets) ---
+        if tok.text.startswith("[") and tok.text.endswith("]"):
+            out.append(tok.text)  
             continue
         lemma = tok.lemma_.strip()
         if not lemma:
