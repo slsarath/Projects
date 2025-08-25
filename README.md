@@ -537,3 +537,111 @@ Where to tune (fast wins)
 	•	Classifier: try XGBoost/LightGBM on the same X if LR tops out.
 
 That’s the full picture. If you want, I can annotate the code with inline comments at every step or drop in a tiny alpha-sweep block you can paste under main() to print the best blend weight for complaint F1/recall.
+
+
+Results:
+
+Nice screenshot — let’s walk through that classification-report table line-by-line and make the numbers concrete so you can act on them.
+
+I’ll first define each metric, then interpret the values in your table, and finally give an exact, approximate count breakdown (how many true/false predictions that implies) and what each tells you to do next.
+
+⸻
+
+What the columns mean
+	•	precision = TP / (TP + FP)
+Of all examples the model predicted this class, how many were actually that class. High precision → few false alarms.
+	•	recall = TP / (TP + FN)
+Of all actual examples of that class, how many did the model find. High recall → few misses.
+	•	f1-score = harmonic mean(precision, recall) = 2·(P·R)/(P+R).
+Single-number balance of precision and recall.
+	•	support = number of ground-truth examples of that class in the evaluated set.
+
+Below the class rows you also see:
+	•	accuracy = (total correct) / (total samples).
+	•	macro avg = unweighted average of the three class metrics (treats each class equally).
+	•	weighted avg = average weighted by each class’s support (reflects dataset imbalance).
+
+⸻
+
+Your table — plain English interpretation
+
+Classes and supports (from the table):
+	•	NEUTRAL: support = 23
+	•	CONCERN: support = 153
+	•	COMPLAINT: support = 100
+Total = 276 samples.
+
+Per-class summary (from your table):
+	1.	NEUTRAL — precision 0.74, recall 1.00, f1 0.85, support 23
+	•	The model found every neutral example (recall 1.00).
+	•	But ~26% of what it labeled “neutral” were actually other classes (precision 0.74) → some false positives.
+	2.	CONCERN — precision 0.81, recall 0.65, f1 0.72, support 153
+	•	Good precision: of predictions labeled “concern,” ~81% are correct.
+	•	But recall is 0.65: it misses ~35% of true concerns.
+	3.	COMPLAINT — precision 0.60, recall 0.74, f1 0.66, support 100
+	•	The model finds ~74% of true complaints (recall 0.74).
+	•	But precision is only 0.60: many predicted complaints are actually something else (false alarms).
+
+Overall accuracy 0.71 — the model made correct predictions for ~71% of the 276 samples (≈196 correct, ≈80 incorrect).
+
+Macro averages (treat each class equally) are about precision 0.72, recall 0.80, f1 0.75.
+Weighted averages (accounting for the 153 concerns dominating the set) are precision ~0.73, recall ~0.71, f1 ~0.71.
+
+⸻
+
+Convert those ratios into actual counts (approximate)
+
+I’ll use the definitions P = TP/(TP+FP) and R = TP/(TP+FN) to derive approximate counts.
+
+Calculations (rounded)
+	•	Neutral (support 23)
+	•	TP ≈ recall × support = 1.00 × 23 = 23 (so FN = 0)
+	•	Predicted as Neutral (PP) ≈ TP / precision = 23 / 0.74 ≈ 31 → so FP ≈ 31 − 23 = 8
+	•	Concern (support 153)
+	•	TP ≈ 0.65 × 153 ≈ 99
+	•	FN = 153 − 99 ≈ 54 (missed concerns)
+	•	Predicted as Concern (PP) ≈ 99 / 0.81 ≈ 123 → FP ≈ 123 − 99 = 24
+	•	Complaint (support 100)
+	•	TP ≈ 0.74 × 100 = 74
+	•	FN = 100 − 74 = 26 (missed complaints)
+	•	Predicted as Complaint (PP) ≈ 74 / 0.60 ≈ 123 → FP ≈ 123 − 74 = 49
+
+Double-check totals:
+	•	Sum of TP ≈ 23 + 99 + 74 = 196 correct predictions (matches accuracy ≈ 0.71 × 276 = 195.96).
+	•	Sum of FP ≈ 8 + 24 + 49 = 81 false positives (≈ total incorrect because FP across classes = FN across classes).
+
+Takeaway from counts:
+	•	The model never misses Neutral (good), but it overpredicts Neutral a bit (8 false positives).
+	•	For Concerns, it misses ~54 of 153 (so 35% of concerns are not labeled as concern).
+	•	For Complaints, it misses 26 of 100 — so complaint recall is decent (74%), but precision is low: about 49 predicted complaints are false alarms.
+
+⸻
+
+What these patterns mean, practically
+	•	If your priority is not missing complaints (high recall): current recall = 0.74. You’re catching most but not all — roughly 1 in 4 complaints is missed. Change needed: favor recall (reduce blending weight, oversample complaint, loosen rules).
+	•	If your priority is not raising false complaint alerts (high precision): current precision = 0.60, meaning ~40% of predicted complaints are false positives — that’s high noise for an operations team.
+	•	Concerns show an asymmetry: high precision, low recall. The model is cautious calling something a concern (fewer false alarms) but therefore misses many real concerns.
+
+⸻
+
+Quick actions suggested from the matrix
+	•	If you want higher complaint recall (catch more complaints):
+	•	Lower rule blending (ALPHA_RULE_BLEND) so ML has more influence, or remove blending and use the model alone (rules are already features).
+	•	Oversample complaints in training (RandomOverSampler or SMOTE) so model learns complaint patterns better.
+	•	Loosen complaint-related rule thresholds (e.g., SIM_THRESHOLD, SENT_STRONG_NEG) so the rules don’t overly filter candidates.
+	•	If you want higher complaint precision (fewer false alarms):
+	•	Keep/increase blending or tighten rules (but that will reduce recall).
+	•	Add secondary heuristics to filter predicted complaints (for example require complaint keyword and low sentiment).
+	•	For concerns, increase recall by adding more concern seed phrases, expanding TF-IDF candidates and retraining, or using oversampling for concern class.
+
+⸻
+
+One final note about averages
+	•	Macro avg is useful when you care about all classes equally (it shows the model is relatively balanced across classes).
+	•	Weighted avg reflects expected performance on your actual dataset mix (here dominated by concerns).
+
+⸻
+
+If you want, I’ll:
+	•	compute and print the exact confusion matrix from your test fold (needs the true/pred arrays), or
+	•	run an alpha sweep on blending to show the precision/recall tradeoff for complaints and pick an alpha that hits a target recall (say 0.85) — pasteable code I can generate for you. Which one should I do next?
